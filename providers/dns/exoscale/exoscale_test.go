@@ -58,6 +58,7 @@ func TestNewDNSProvider(t *testing.T) {
 	for _, test := range testCases {
 		t.Run(test.desc, func(t *testing.T) {
 			defer envTest.RestoreEnv()
+
 			envTest.ClearEnv()
 
 			envTest.Apply(test.envVars)
@@ -140,35 +141,31 @@ func TestDNSProvider_FindZoneAndRecordName(t *testing.T) {
 	testCases := []struct {
 		desc     string
 		fqdn     string
-		domain   string
 		expected expected
 	}{
 		{
-			desc:   "Extract root record name",
-			fqdn:   "_acme-challenge.bar.com.",
-			domain: "bar.com",
+			desc: "Extract root record name",
+			fqdn: "_acme-challenge.example.com.",
 			expected: expected{
-				zone:       "bar.com",
+				zone:       "example.com",
 				recordName: "_acme-challenge",
 			},
 		},
 		{
-			desc:   "Extract sub record name",
-			fqdn:   "_acme-challenge.foo.bar.com.",
-			domain: "foo.bar.com",
+			desc: "Extract sub record name",
+			fqdn: "_acme-challenge.foo.example.com.",
 			expected: expected{
-				zone:       "bar.com",
+				zone:       "example.com",
 				recordName: "_acme-challenge.foo",
 			},
 		},
 	}
 
 	for _, test := range testCases {
-		test := test
 		t.Run(test.desc, func(t *testing.T) {
 			t.Parallel()
 
-			zone, recordName, err := provider.FindZoneAndRecordName(test.fqdn, test.domain)
+			zone, recordName, err := provider.findZoneAndRecordName(test.fqdn)
 			require.NoError(t, err)
 			assert.Equal(t, test.expected.zone, zone)
 			assert.Equal(t, test.expected.recordName, recordName)
@@ -182,6 +179,7 @@ func TestLivePresent(t *testing.T) {
 	}
 
 	envTest.RestoreEnv()
+
 	provider, err := NewDNSProvider()
 	require.NoError(t, err)
 
@@ -199,6 +197,7 @@ func TestLiveCleanUp(t *testing.T) {
 	}
 
 	envTest.RestoreEnv()
+
 	provider, err := NewDNSProvider()
 	require.NoError(t, err)
 

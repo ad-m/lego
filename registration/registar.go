@@ -9,11 +9,13 @@ import (
 	"github.com/go-acme/lego/v4/log"
 )
 
+const mailTo = "mailto:"
+
 // Resource represents all important information about a registration
 // of which the client needs to keep track itself.
-// WARNING: will be remove in the future (acme.ExtendedAccount), https://github.com/go-acme/lego/issues/855.
+// WARNING: will be removed in the future (acme.ExtendedAccount), https://github.com/go-acme/lego/issues/855.
 type Resource struct {
-	Body acme.Account `json:"body,omitempty"`
+	Body acme.Account `json:"body"`
 	URI  string       `json:"uri,omitempty"`
 }
 
@@ -52,13 +54,13 @@ func (r *Registrar) Register(options RegisterOptions) (*Resource, error) {
 
 	if r.user.GetEmail() != "" {
 		log.Infof("acme: Registering account for %s", r.user.GetEmail())
-		accMsg.Contact = []string{"mailto:" + r.user.GetEmail()}
+		accMsg.Contact = []string{mailTo + r.user.GetEmail()}
 	}
 
 	account, err := r.core.Accounts.New(accMsg)
 	if err != nil {
 		// seems impossible
-		var errorDetails acme.ProblemDetails
+		errorDetails := &acme.ProblemDetails{}
 		if !errors.As(err, &errorDetails) || errorDetails.HTTPStatus != http.StatusConflict {
 			return nil, err
 		}
@@ -76,13 +78,13 @@ func (r *Registrar) RegisterWithExternalAccountBinding(options RegisterEABOption
 
 	if r.user.GetEmail() != "" {
 		log.Infof("acme: Registering account for %s", r.user.GetEmail())
-		accMsg.Contact = []string{"mailto:" + r.user.GetEmail()}
+		accMsg.Contact = []string{mailTo + r.user.GetEmail()}
 	}
 
 	account, err := r.core.Accounts.NewEAB(accMsg, options.Kid, options.HmacEncoded)
 	if err != nil {
 		// seems impossible
-		var errorDetails acme.ProblemDetails
+		errorDetails := &acme.ProblemDetails{}
 		if !errors.As(err, &errorDetails) || errorDetails.HTTPStatus != http.StatusConflict {
 			return nil, err
 		}
@@ -128,7 +130,7 @@ func (r *Registrar) UpdateRegistration(options RegisterOptions) (*Resource, erro
 
 	if r.user.GetEmail() != "" {
 		log.Infof("acme: Registering account for %s", r.user.GetEmail())
-		accMsg.Contact = []string{"mailto:" + r.user.GetEmail()}
+		accMsg.Contact = []string{mailTo + r.user.GetEmail()}
 	}
 
 	accountURL := r.user.GetRegistration().URI
@@ -158,6 +160,7 @@ func (r *Registrar) ResolveAccountByKey() (*Resource, error) {
 	log.Infof("acme: Trying to resolve account by key")
 
 	accMsg := acme.Account{OnlyReturnExisting: true}
+
 	account, err := r.core.Accounts.New(accMsg)
 	if err != nil {
 		return nil, err

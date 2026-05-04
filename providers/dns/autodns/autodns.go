@@ -2,14 +2,18 @@
 package autodns
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
 	"time"
 
+	"github.com/go-acme/lego/v4/challenge"
 	"github.com/go-acme/lego/v4/challenge/dns01"
 	"github.com/go-acme/lego/v4/platform/config/env"
+	"github.com/go-acme/lego/v4/providers/dns/autodns/internal"
+	"github.com/go-acme/lego/v4/providers/dns/internal/clientdebug"
 )
 
 // Environment variables names.
@@ -27,10 +31,7 @@ const (
 	EnvHTTPTimeout        = envNamespace + "HTTP_TIMEOUT"
 )
 
-const (
-	defaultEndpointContext int = 4
-	defaultTTL             int = 600
-)
+var _ challenge.ProviderTimeout = (*DNSProvider)(nil)
 
 // Config is used to configure the creation of the DNSProvider.
 type Config struct {
@@ -46,12 +47,12 @@ type Config struct {
 
 // NewDefaultConfig returns a default configuration for the DNSProvider.
 func NewDefaultConfig() *Config {
-	endpoint, _ := url.Parse(env.GetOrDefaultString(EnvAPIEndpoint, defaultEndpoint))
+	endpoint, _ := url.Parse(env.GetOrDefaultString(EnvAPIEndpoint, internal.DefaultEndpoint))
 
 	return &Config{
 		Endpoint:           endpoint,
-		Context:            env.GetOrDefaultInt(EnvAPIEndpointContext, defaultEndpointContext),
-		TTL:                env.GetOrDefaultInt(EnvTTL, defaultTTL),
+		Context:            env.GetOrDefaultInt(EnvAPIEndpointContext, internal.DefaultEndpointContext),
+		TTL:                env.GetOrDefaultInt(EnvTTL, 600),
 		PropagationTimeout: env.GetOrDefaultSecond(EnvPropagationTimeout, 2*time.Minute),
 		PollingInterval:    env.GetOrDefaultSecond(EnvPollingInterval, 2*time.Second),
 		HTTPClient: &http.Client{
@@ -63,6 +64,7 @@ func NewDefaultConfig() *Config {
 // DNSProvider implements the challenge.Provider interface.
 type DNSProvider struct {
 	config *Config
+	client *internal.Client
 }
 
 // NewDNSProvider returns a DNSProvider instance configured for autoDNS.
@@ -94,7 +96,19 @@ func NewDNSProviderConfig(config *Config) (*DNSProvider, error) {
 		return nil, errors.New("autodns: missing password")
 	}
 
-	return &DNSProvider{config: config}, nil
+	client := internal.NewClient(config.Username, config.Password, config.Context)
+
+	if config.Endpoint != nil {
+		client.BaseURL = config.Endpoint
+	}
+
+	if config.HTTPClient != nil {
+		client.HTTPClient = config.HTTPClient
+	}
+
+	client.HTTPClient = clientdebug.Wrap(client.HTTPClient)
+
+	return &DNSProvider{config: config, client: client}, nil
 }
 
 // Timeout returns the timeout and interval to use when checking for DNS propagation.
@@ -105,18 +119,18 @@ func (d *DNSProvider) Timeout() (timeout, interval time.Duration) {
 
 // Present creates a TXT record to fulfill the dns-01 challenge.
 func (d *DNSProvider) Present(domain, token, keyAuth string) error {
-	fqdn, value := dns01.GetRecord(domain, keyAuth)
+	info := dns01.GetChallengeInfo(domain, keyAuth)
 
-	records := []*ResourceRecord{{
-		Name:  fqdn,
+	records := []*internal.ResourceRecord{{
+		Name:  info.EffectiveFQDN,
 		TTL:   int64(d.config.TTL),
 		Type:  "TXT",
-		Value: value,
+		Value: info.Value,
 	}}
 
-	_, err := d.addTxtRecord(domain, records)
+	_, err := d.client.AddRecords(context.Background(), info.EffectiveFQDN, records)
 	if err != nil {
-		return fmt.Errorf("autodns: %w", err)
+		return fmt.Errorf("autodns: add record: %w", err)
 	}
 
 	return nil
@@ -124,17 +138,18 @@ func (d *DNSProvider) Present(domain, token, keyAuth string) error {
 
 // CleanUp removes the TXT record previously created.
 func (d *DNSProvider) CleanUp(domain, token, keyAuth string) error {
-	fqdn, value := dns01.GetRecord(domain, keyAuth)
+	info := dns01.GetChallengeInfo(domain, keyAuth)
 
-	records := []*ResourceRecord{{
-		Name:  fqdn,
+	records := []*internal.ResourceRecord{{
+		Name:  info.EffectiveFQDN,
 		TTL:   int64(d.config.TTL),
 		Type:  "TXT",
-		Value: value,
+		Value: info.Value,
 	}}
 
-	if err := d.removeTXTRecord(domain, records); err != nil {
-		return fmt.Errorf("autodns: %w", err)
+	_, err := d.client.RemoveRecords(context.Background(), info.EffectiveFQDN, records)
+	if err != nil {
+		return fmt.Errorf("autodns: remove record: %w", err)
 	}
 
 	return nil

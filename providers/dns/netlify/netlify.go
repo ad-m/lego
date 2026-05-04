@@ -2,6 +2,7 @@
 package netlify
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
@@ -9,8 +10,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/go-acme/lego/v4/challenge"
 	"github.com/go-acme/lego/v4/challenge/dns01"
 	"github.com/go-acme/lego/v4/platform/config/env"
+	"github.com/go-acme/lego/v4/providers/dns/internal/clientdebug"
 	"github.com/go-acme/lego/v4/providers/dns/netlify/internal"
 )
 
@@ -25,6 +28,8 @@ const (
 	EnvPollingInterval    = envNamespace + "POLLING_INTERVAL"
 	EnvHTTPTimeout        = envNamespace + "HTTP_TIMEOUT"
 )
+
+var _ challenge.ProviderTimeout = (*DNSProvider)(nil)
 
 // Config is used to configure the creation of the DNSProvider.
 type Config struct {
@@ -80,11 +85,11 @@ func NewDNSProviderConfig(config *Config) (*DNSProvider, error) {
 		return nil, errors.New("netlify: incomplete credentials, missing token")
 	}
 
-	client := internal.NewClient(config.Token)
-
-	if config.HTTPClient != nil {
-		client.HTTPClient = config.HTTPClient
-	}
+	client := internal.NewClient(
+		clientdebug.Wrap(
+			internal.OAuthStaticAccessToken(config.HTTPClient, config.Token),
+		),
+	)
 
 	return &DNSProvider{
 		config:    config,
@@ -101,25 +106,25 @@ func (d *DNSProvider) Timeout() (timeout, interval time.Duration) {
 
 // Present creates a TXT record using the specified parameters.
 func (d *DNSProvider) Present(domain, token, keyAuth string) error {
-	fqdn, value := dns01.GetRecord(domain, keyAuth)
+	info := dns01.GetChallengeInfo(domain, keyAuth)
 
-	authZone, err := dns01.FindZoneByFqdn(fqdn)
+	authZone, err := dns01.FindZoneByFqdn(info.EffectiveFQDN)
 	if err != nil {
-		return fmt.Errorf("netlify: failed to find zone: %w", err)
+		return fmt.Errorf("netlify: could not find zone for domain %q: %w", domain, err)
 	}
 
 	authZone = dns01.UnFqdn(authZone)
 
 	record := internal.DNSRecord{
-		Hostname: dns01.UnFqdn(fqdn),
+		Hostname: dns01.UnFqdn(info.EffectiveFQDN),
 		TTL:      d.config.TTL,
 		Type:     "TXT",
-		Value:    value,
+		Value:    info.Value,
 	}
 
-	resp, err := d.client.CreateRecord(strings.ReplaceAll(authZone, ".", "_"), record)
+	resp, err := d.client.CreateRecord(context.Background(), strings.ReplaceAll(authZone, ".", "_"), record)
 	if err != nil {
-		return fmt.Errorf("netlify: failed to create TXT records: fqdn=%s, authZone=%s: %w", fqdn, authZone, err)
+		return fmt.Errorf("netlify: failed to create TXT records: fqdn=%s, authZone=%s: %w", info.EffectiveFQDN, authZone, err)
 	}
 
 	d.recordIDsMu.Lock()
@@ -131,11 +136,11 @@ func (d *DNSProvider) Present(domain, token, keyAuth string) error {
 
 // CleanUp removes the TXT record matching the specified parameters.
 func (d *DNSProvider) CleanUp(domain, token, keyAuth string) error {
-	fqdn, _ := dns01.GetRecord(domain, keyAuth)
+	info := dns01.GetChallengeInfo(domain, keyAuth)
 
-	authZone, err := dns01.FindZoneByFqdn(fqdn)
+	authZone, err := dns01.FindZoneByFqdn(info.EffectiveFQDN)
 	if err != nil {
-		return fmt.Errorf("netlify: failed to find zone: %w", err)
+		return fmt.Errorf("netlify: could not find zone for domain %q: %w", domain, err)
 	}
 
 	authZone = dns01.UnFqdn(authZone)
@@ -144,13 +149,14 @@ func (d *DNSProvider) CleanUp(domain, token, keyAuth string) error {
 	d.recordIDsMu.Lock()
 	recordID, ok := d.recordIDs[token]
 	d.recordIDsMu.Unlock()
+
 	if !ok {
-		return fmt.Errorf("netlify: unknown record ID for '%s' '%s'", fqdn, token)
+		return fmt.Errorf("netlify: unknown record ID for '%s' '%s'", info.EffectiveFQDN, token)
 	}
 
-	err = d.client.RemoveRecord(strings.ReplaceAll(authZone, ".", "_"), recordID)
+	err = d.client.RemoveRecord(context.Background(), strings.ReplaceAll(authZone, ".", "_"), recordID)
 	if err != nil {
-		return fmt.Errorf("netlify: failed to delete TXT records: fqdn=%s, authZone=%s, recordID=%s: %w", fqdn, authZone, recordID, err)
+		return fmt.Errorf("netlify: failed to delete TXT records: fqdn=%s, authZone=%s, recordID=%s: %w", info.EffectiveFQDN, authZone, recordID, err)
 	}
 
 	// deletes record ID from map

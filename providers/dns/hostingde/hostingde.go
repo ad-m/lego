@@ -5,11 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"sync"
 	"time"
 
+	"github.com/go-acme/lego/v4/challenge"
 	"github.com/go-acme/lego/v4/challenge/dns01"
 	"github.com/go-acme/lego/v4/platform/config/env"
+	"github.com/go-acme/lego/v4/providers/dns/internal/hostingde"
 )
 
 // Environment variables names.
@@ -25,22 +26,18 @@ const (
 	EnvHTTPTimeout        = envNamespace + "HTTP_TIMEOUT"
 )
 
+var _ challenge.ProviderTimeout = (*DNSProvider)(nil)
+
 // Config is used to configure the creation of the DNSProvider.
-type Config struct {
-	APIKey             string
-	ZoneName           string
-	PropagationTimeout time.Duration
-	PollingInterval    time.Duration
-	TTL                int
-	HTTPClient         *http.Client
-}
+type Config = hostingde.Config
 
 // NewDefaultConfig returns a default configuration for the DNSProvider.
 func NewDefaultConfig() *Config {
 	return &Config{
+		ZoneName:           env.GetOrFile(EnvZoneName),
 		TTL:                env.GetOrDefaultInt(EnvTTL, dns01.DefaultTTL),
 		PropagationTimeout: env.GetOrDefaultSecond(EnvPropagationTimeout, 2*time.Minute),
-		PollingInterval:    env.GetOrDefaultSecond(EnvPollingInterval, 2*time.Second),
+		PollingInterval:    env.GetOrDefaultSecond(EnvPollingInterval, dns01.DefaultPollingInterval),
 		HTTPClient: &http.Client{
 			Timeout: env.GetOrDefaultSecond(EnvHTTPTimeout, 30*time.Second),
 		},
@@ -49,23 +46,20 @@ func NewDefaultConfig() *Config {
 
 // DNSProvider implements the challenge.Provider interface.
 type DNSProvider struct {
-	config      *Config
-	recordIDs   map[string]string
-	recordIDsMu sync.Mutex
+	prv challenge.ProviderTimeout
 }
 
 // NewDNSProvider returns a DNSProvider instance configured for hosting.de.
 // Credentials must be passed in the environment variables:
 // HOSTINGDE_ZONE_NAME and HOSTINGDE_API_KEY.
 func NewDNSProvider() (*DNSProvider, error) {
-	values, err := env.Get(EnvAPIKey, EnvZoneName)
+	values, err := env.Get(EnvAPIKey)
 	if err != nil {
 		return nil, fmt.Errorf("hostingde: %w", err)
 	}
 
 	config := NewDefaultConfig()
 	config.APIKey = values[EnvAPIKey]
-	config.ZoneName = values[EnvZoneName]
 
 	return NewDNSProviderConfig(config)
 }
@@ -76,75 +70,19 @@ func NewDNSProviderConfig(config *Config) (*DNSProvider, error) {
 		return nil, errors.New("hostingde: the configuration of the DNS provider is nil")
 	}
 
-	if config.APIKey == "" {
-		return nil, errors.New("hostingde: API key missing")
+	provider, err := hostingde.NewDNSProviderConfig(config, "")
+	if err != nil {
+		return nil, fmt.Errorf("hostingde: %w", err)
 	}
 
-	if config.ZoneName == "" {
-		return nil, errors.New("hostingde: Zone Name missing")
-	}
-
-	return &DNSProvider{
-		config:    config,
-		recordIDs: make(map[string]string),
-	}, nil
+	return &DNSProvider{prv: provider}, nil
 }
 
-// Timeout returns the timeout and interval to use when checking for DNS propagation.
-// Adjusting here to cope with spikes in propagation times.
-func (d *DNSProvider) Timeout() (timeout, interval time.Duration) {
-	return d.config.PropagationTimeout, d.config.PollingInterval
-}
-
-// Present creates a TXT record to fulfill the dns-01 challenge.
+// Present creates a TXT record using the specified parameters.
 func (d *DNSProvider) Present(domain, token, keyAuth string) error {
-	fqdn, value := dns01.GetRecord(domain, keyAuth)
-
-	// get the ZoneConfig for that domain
-	zonesFind := ZoneConfigsFindRequest{
-		Filter: Filter{
-			Field: "zoneName",
-			Value: d.config.ZoneName,
-		},
-		Limit: 1,
-		Page:  1,
-	}
-	zonesFind.AuthToken = d.config.APIKey
-
-	zoneConfig, err := d.getZone(zonesFind)
+	err := d.prv.Present(domain, token, keyAuth)
 	if err != nil {
 		return fmt.Errorf("hostingde: %w", err)
-	}
-	zoneConfig.Name = d.config.ZoneName
-
-	rec := []DNSRecord{{
-		Type:    "TXT",
-		Name:    dns01.UnFqdn(fqdn),
-		Content: value,
-		TTL:     d.config.TTL,
-	}}
-
-	req := ZoneUpdateRequest{
-		ZoneConfig:   *zoneConfig,
-		RecordsToAdd: rec,
-	}
-	req.AuthToken = d.config.APIKey
-
-	resp, err := d.updateZone(req)
-	if err != nil {
-		return fmt.Errorf("hostingde: %w", err)
-	}
-
-	for _, record := range resp.Response.Records {
-		if record.Name == dns01.UnFqdn(fqdn) && record.Content == fmt.Sprintf(`"%s"`, value) {
-			d.recordIDsMu.Lock()
-			d.recordIDs[fqdn] = record.ID
-			d.recordIDsMu.Unlock()
-		}
-	}
-
-	if d.recordIDs[fqdn] == "" {
-		return fmt.Errorf("hostingde: error getting ID of just created record, for domain %s", domain)
 	}
 
 	return nil
@@ -152,45 +90,16 @@ func (d *DNSProvider) Present(domain, token, keyAuth string) error {
 
 // CleanUp removes the TXT record matching the specified parameters.
 func (d *DNSProvider) CleanUp(domain, token, keyAuth string) error {
-	fqdn, value := dns01.GetRecord(domain, keyAuth)
-
-	rec := []DNSRecord{{
-		Type:    "TXT",
-		Name:    dns01.UnFqdn(fqdn),
-		Content: `"` + value + `"`,
-	}}
-
-	// get the ZoneConfig for that domain
-	zonesFind := ZoneConfigsFindRequest{
-		Filter: Filter{
-			Field: "zoneName",
-			Value: d.config.ZoneName,
-		},
-		Limit: 1,
-		Page:  1,
-	}
-	zonesFind.AuthToken = d.config.APIKey
-
-	zoneConfig, err := d.getZone(zonesFind)
+	err := d.prv.CleanUp(domain, token, keyAuth)
 	if err != nil {
 		return fmt.Errorf("hostingde: %w", err)
 	}
-	zoneConfig.Name = d.config.ZoneName
 
-	req := ZoneUpdateRequest{
-		ZoneConfig:      *zoneConfig,
-		RecordsToDelete: rec,
-	}
-	req.AuthToken = d.config.APIKey
-
-	// Delete record ID from map
-	d.recordIDsMu.Lock()
-	delete(d.recordIDs, fqdn)
-	d.recordIDsMu.Unlock()
-
-	_, err = d.updateZone(req)
-	if err != nil {
-		return fmt.Errorf("hostingde: %w", err)
-	}
 	return nil
+}
+
+// Timeout returns the timeout and interval to use when checking for DNS propagation.
+// Adjusting here to cope with spikes in propagation times.
+func (d *DNSProvider) Timeout() (timeout, interval time.Duration) {
+	return d.prv.Timeout()
 }

@@ -3,13 +3,16 @@ title: "DNS Made Easy"
 date: 2019-03-03T16:39:46+01:00
 draft: false
 slug: dnsmadeeasy
+dnsprovider:
+  since:    "v0.4.0"
+  code:     "dnsmadeeasy"
+  url:      "https://dnsmadeeasy.com/"
 ---
 
 <!-- THIS DOCUMENTATION IS AUTO-GENERATED. PLEASE DO NOT EDIT. -->
 <!-- providers/dns/dnsmadeeasy/dnsmadeeasy.toml -->
 <!-- THIS DOCUMENTATION IS AUTO-GENERATED. PLEASE DO NOT EDIT. -->
 
-Since: v0.4.0
 
 Configuration for [DNS Made Easy](https://dnsmadeeasy.com/).
 
@@ -17,13 +20,15 @@ Configuration for [DNS Made Easy](https://dnsmadeeasy.com/).
 <!--more-->
 
 - Code: `dnsmadeeasy`
+- Since: v0.4.0
+
 
 Here is an example bash command using the DNS Made Easy provider:
 
 ```bash
 DNSMADEEASY_API_KEY=xxxxxx \
 DNSMADEEASY_API_SECRET=yyyyy \
-lego --email myemail@example.com --dns dnsmadeeasy --domains my.example.org run
+lego --dns dnsmadeeasy -d '*.example.com' -d example.com run
 ```
 
 
@@ -37,21 +42,21 @@ lego --email myemail@example.com --dns dnsmadeeasy --domains my.example.org run
 | `DNSMADEEASY_API_SECRET` | The API Secret key |
 
 The environment variable names can be suffixed by `_FILE` to reference a file instead of a value.
-More information [here](/lego/dns/#configuration-and-credentials).
+More information [here]({{% ref "dns#configuration-and-credentials" %}}).
 
 
 ## Additional Configuration
 
 | Environment Variable Name | Description |
 |--------------------------------|-------------|
-| `DNSMADEEASY_HTTP_TIMEOUT` | API request timeout |
-| `DNSMADEEASY_POLLING_INTERVAL` | Time between DNS propagation check |
-| `DNSMADEEASY_PROPAGATION_TIMEOUT` | Maximum waiting time for DNS propagation |
+| `DNSMADEEASY_HTTP_TIMEOUT` | API request timeout in seconds (Default: 10) |
+| `DNSMADEEASY_POLLING_INTERVAL` | Time between DNS propagation check in seconds (Default: 2) |
+| `DNSMADEEASY_PROPAGATION_TIMEOUT` | Maximum waiting time for DNS propagation in seconds (Default: 60) |
 | `DNSMADEEASY_SANDBOX` | Activate the sandbox (boolean) |
-| `DNSMADEEASY_TTL` | The TTL of the TXT record used for the DNS challenge |
+| `DNSMADEEASY_TTL` | The TTL of the TXT record used for the DNS challenge in seconds (Default: 120) |
 
 The environment variable names can be suffixed by `_FILE` to reference a file instead of a value.
-More information [here](/lego/dns/#configuration-and-credentials).
+More information [here]({{% ref "dns#configuration-and-credentials" %}}).
 
 
 

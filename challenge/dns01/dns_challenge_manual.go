@@ -8,46 +8,54 @@ import (
 )
 
 const (
-	dnsTemplate = `%s %d IN TXT "%s"`
+	dnsTemplate = `%s %d IN TXT %q`
 )
 
 // DNSProviderManual is an implementation of the ChallengeProvider interface.
+// TODO(ldez): move this to providers/dns/manual
+//
+// Deprecated: Use the manual.DNSProvider instead.
 type DNSProviderManual struct{}
 
 // NewDNSProviderManual returns a DNSProviderManual instance.
+//
+// Deprecated: Use the manual.NewDNSProvider instead.
 func NewDNSProviderManual() (*DNSProviderManual, error) {
 	return &DNSProviderManual{}, nil
 }
 
 // Present prints instructions for manually creating the TXT record.
 func (*DNSProviderManual) Present(domain, token, keyAuth string) error {
-	fqdn, value := GetRecord(domain, keyAuth)
+	info := GetChallengeInfo(domain, keyAuth)
 
-	authZone, err := FindZoneByFqdn(fqdn)
+	authZone, err := FindZoneByFqdn(info.EffectiveFQDN)
 	if err != nil {
-		return err
+		return fmt.Errorf("manual: could not find zone: %w", err)
 	}
 
 	fmt.Printf("lego: Please create the following TXT record in your %s zone:\n", authZone)
-	fmt.Printf(dnsTemplate+"\n", fqdn, DefaultTTL, value)
+	fmt.Printf(dnsTemplate+"\n", info.EffectiveFQDN, DefaultTTL, info.Value)
 	fmt.Printf("lego: Press 'Enter' when you are done\n")
 
 	_, err = bufio.NewReader(os.Stdin).ReadBytes('\n')
+	if err != nil {
+		return fmt.Errorf("manual: %w", err)
+	}
 
-	return err
+	return nil
 }
 
 // CleanUp prints instructions for manually removing the TXT record.
 func (*DNSProviderManual) CleanUp(domain, token, keyAuth string) error {
-	fqdn, _ := GetRecord(domain, keyAuth)
+	info := GetChallengeInfo(domain, keyAuth)
 
-	authZone, err := FindZoneByFqdn(fqdn)
+	authZone, err := FindZoneByFqdn(info.EffectiveFQDN)
 	if err != nil {
-		return err
+		return fmt.Errorf("manual: could not find zone: %w", err)
 	}
 
 	fmt.Printf("lego: You can now remove this TXT record from your %s zone:\n", authZone)
-	fmt.Printf(dnsTemplate+"\n", fqdn, DefaultTTL, "...")
+	fmt.Printf(dnsTemplate+"\n", info.EffectiveFQDN, DefaultTTL, "...")
 
 	return nil
 }

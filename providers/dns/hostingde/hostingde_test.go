@@ -25,7 +25,7 @@ func TestNewDNSProvider(t *testing.T) {
 			desc: "success",
 			envVars: map[string]string{
 				EnvAPIKey:   "123",
-				EnvZoneName: "456",
+				EnvZoneName: "example.org",
 			},
 		},
 		{
@@ -34,7 +34,7 @@ func TestNewDNSProvider(t *testing.T) {
 				EnvAPIKey:   "",
 				EnvZoneName: "",
 			},
-			expected: "hostingde: some credentials information are missing: HOSTINGDE_API_KEY,HOSTINGDE_ZONE_NAME",
+			expected: "hostingde: some credentials information are missing: HOSTINGDE_API_KEY",
 		},
 		{
 			desc: "missing access key",
@@ -44,19 +44,12 @@ func TestNewDNSProvider(t *testing.T) {
 			},
 			expected: "hostingde: some credentials information are missing: HOSTINGDE_API_KEY",
 		},
-		{
-			desc: "missing zone name",
-			envVars: map[string]string{
-				EnvAPIKey:   "123",
-				EnvZoneName: "",
-			},
-			expected: "hostingde: some credentials information are missing: HOSTINGDE_ZONE_NAME",
-		},
 	}
 
 	for _, test := range testCases {
 		t.Run(test.desc, func(t *testing.T) {
 			defer envTest.RestoreEnv()
+
 			envTest.ClearEnv()
 
 			envTest.Apply(test.envVars)
@@ -66,8 +59,7 @@ func TestNewDNSProvider(t *testing.T) {
 			if test.expected == "" {
 				require.NoError(t, err)
 				require.NotNil(t, p)
-				require.NotNil(t, p.config)
-				require.NotNil(t, p.recordIDs)
+				require.NotNil(t, p.prv)
 			} else {
 				require.EqualError(t, err, test.expected)
 			}
@@ -85,7 +77,7 @@ func TestNewDNSProviderConfig(t *testing.T) {
 		{
 			desc:     "success",
 			apiKey:   "123",
-			zoneName: "456",
+			zoneName: "example.org",
 		},
 		{
 			desc:     "missing credentials",
@@ -95,11 +87,6 @@ func TestNewDNSProviderConfig(t *testing.T) {
 			desc:     "missing api key",
 			zoneName: "456",
 			expected: "hostingde: API key missing",
-		},
-		{
-			desc:     "missing zone name",
-			apiKey:   "123",
-			expected: "hostingde: Zone Name missing",
 		},
 	}
 
@@ -114,8 +101,7 @@ func TestNewDNSProviderConfig(t *testing.T) {
 			if test.expected == "" {
 				require.NoError(t, err)
 				require.NotNil(t, p)
-				require.NotNil(t, p.config)
-				require.NotNil(t, p.recordIDs)
+				require.NotNil(t, p.prv)
 			} else {
 				require.EqualError(t, err, test.expected)
 			}
@@ -129,6 +115,7 @@ func TestLivePresent(t *testing.T) {
 	}
 
 	envTest.RestoreEnv()
+
 	provider, err := NewDNSProvider()
 	require.NoError(t, err)
 
@@ -142,6 +129,7 @@ func TestLiveCleanUp(t *testing.T) {
 	}
 
 	envTest.RestoreEnv()
+
 	provider, err := NewDNSProvider()
 	require.NoError(t, err)
 

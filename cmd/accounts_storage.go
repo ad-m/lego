@@ -2,12 +2,8 @@ package cmd
 
 import (
 	"crypto"
-	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
-	"errors"
-	"fmt"
-	"io/ioutil"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -17,8 +13,10 @@ import (
 	"github.com/go-acme/lego/v4/lego"
 	"github.com/go-acme/lego/v4/log"
 	"github.com/go-acme/lego/v4/registration"
-	"github.com/urfave/cli"
+	"github.com/urfave/cli/v2"
 )
+
+const userIDPlaceholder = "noemail@example.com"
 
 const (
 	baseAccountsRootFolderName = "accounts"
@@ -30,38 +28,38 @@ const (
 //
 // rootPath:
 //
-//     ./.lego/accounts/
-//          │      └── root accounts directory
-//          └── "path" option
+//	./.lego/accounts/
+//	     │      └── root accounts directory
+//	     └── "path" option
 //
 // rootUserPath:
 //
-//     ./.lego/accounts/localhost_14000/hubert@hubert.com/
-//          │      │             │             └── userID ("email" option)
-//          │      │             └── CA server ("server" option)
-//          │      └── root accounts directory
-//          └── "path" option
+//	./.lego/accounts/localhost_14000/foo@example.com/
+//	     │      │             │             └── userID ("email" option)
+//	     │      │             └── CA server ("server" option)
+//	     │      └── root accounts directory
+//	     └── "path" option
 //
 // keysPath:
 //
-//     ./.lego/accounts/localhost_14000/hubert@hubert.com/keys/
-//          │      │             │             │           └── root keys directory
-//          │      │             │             └── userID ("email" option)
-//          │      │             └── CA server ("server" option)
-//          │      └── root accounts directory
-//          └── "path" option
+//	./.lego/accounts/localhost_14000/foo@example.com/keys/
+//	     │      │             │             │           └── root keys directory
+//	     │      │             │             └── userID ("email" option)
+//	     │      │             └── CA server ("server" option)
+//	     │      └── root accounts directory
+//	     └── "path" option
 //
 // accountFilePath:
 //
-//     ./.lego/accounts/localhost_14000/hubert@hubert.com/account.json
-//          │      │             │             │             └── account file
-//          │      │             │             └── userID ("email" option)
-//          │      │             └── CA server ("server" option)
-//          │      └── root accounts directory
-//          └── "path" option
-//
+//	./.lego/accounts/localhost_14000/foo@example.com/account.json
+//	     │      │             │             │             └── account file
+//	     │      │             │             └── userID ("email" option)
+//	     │      │             └── CA server ("server" option)
+//	     │      └── root accounts directory
+//	     └── "path" option
 type AccountsStorage struct {
 	userID          string
+	email           string
 	rootPath        string
 	rootUserPath    string
 	keysPath        string
@@ -71,21 +69,27 @@ type AccountsStorage struct {
 
 // NewAccountsStorage Creates a new AccountsStorage.
 func NewAccountsStorage(ctx *cli.Context) *AccountsStorage {
-	// TODO: move to account struct? Currently MUST pass email.
-	email := getEmail(ctx)
+	// TODO: move to account struct?
+	email := ctx.String(flgEmail)
 
-	serverURL, err := url.Parse(ctx.GlobalString("server"))
+	userID := email
+	if userID == "" {
+		userID = userIDPlaceholder
+	}
+
+	serverURL, err := url.Parse(ctx.String(flgServer))
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	rootPath := filepath.Join(ctx.GlobalString("path"), baseAccountsRootFolderName)
+	rootPath := filepath.Join(ctx.String(flgPath), baseAccountsRootFolderName)
 	serverPath := strings.NewReplacer(":", "_", "/", string(os.PathSeparator)).Replace(serverURL.Host)
 	accountsPath := filepath.Join(rootPath, serverPath)
-	rootUserPath := filepath.Join(accountsPath, email)
+	rootUserPath := filepath.Join(accountsPath, userID)
 
 	return &AccountsStorage{
-		userID:          email,
+		userID:          userID,
+		email:           email,
 		rootPath:        rootPath,
 		rootUserPath:    rootUserPath,
 		keysPath:        filepath.Join(rootUserPath, baseKeysFolderName),
@@ -101,6 +105,7 @@ func (s *AccountsStorage) ExistsAccountFilePath() bool {
 	} else if err != nil {
 		log.Fatal(err)
 	}
+
 	return true
 }
 
@@ -116,25 +121,30 @@ func (s *AccountsStorage) GetUserID() string {
 	return s.userID
 }
 
+func (s *AccountsStorage) GetEmail() string {
+	return s.email
+}
+
 func (s *AccountsStorage) Save(account *Account) error {
 	jsonBytes, err := json.MarshalIndent(account, "", "\t")
 	if err != nil {
 		return err
 	}
 
-	return ioutil.WriteFile(s.accountFilePath, jsonBytes, filePerm)
+	return os.WriteFile(s.accountFilePath, jsonBytes, filePerm)
 }
 
 func (s *AccountsStorage) LoadAccount(privateKey crypto.PrivateKey) *Account {
-	fileBytes, err := ioutil.ReadFile(s.accountFilePath)
+	fileBytes, err := os.ReadFile(s.accountFilePath)
 	if err != nil {
-		log.Fatalf("Could not load file for account %s: %v", s.userID, err)
+		log.Fatalf("Could not load file for account %s: %v", s.GetUserID(), err)
 	}
 
 	var account Account
+
 	err = json.Unmarshal(fileBytes, &account)
 	if err != nil {
-		log.Fatalf("Could not parse file for account %s: %v", s.userID, err)
+		log.Fatalf("Could not parse file for account %s: %v", s.GetUserID(), err)
 	}
 
 	account.key = privateKey
@@ -142,13 +152,14 @@ func (s *AccountsStorage) LoadAccount(privateKey crypto.PrivateKey) *Account {
 	if account.Registration == nil || account.Registration.Body.Status == "" {
 		reg, err := tryRecoverRegistration(s.ctx, privateKey)
 		if err != nil {
-			log.Fatalf("Could not load account for %s. Registration is nil: %#v", s.userID, err)
+			log.Fatalf("Could not load account for %s. Registration is nil: %#v", s.GetUserID(), err)
 		}
 
 		account.Registration = reg
+
 		err = s.Save(&account)
 		if err != nil {
-			log.Fatalf("Could not save account for %s. Registration is nil: %#v", s.userID, err)
+			log.Fatalf("Could not save account for %s. Registration is nil: %#v", s.GetUserID(), err)
 		}
 	}
 
@@ -156,18 +167,19 @@ func (s *AccountsStorage) LoadAccount(privateKey crypto.PrivateKey) *Account {
 }
 
 func (s *AccountsStorage) GetPrivateKey(keyType certcrypto.KeyType) crypto.PrivateKey {
-	accKeyPath := filepath.Join(s.keysPath, s.userID+".key")
+	accKeyPath := filepath.Join(s.keysPath, s.GetUserID()+".key")
 
 	if _, err := os.Stat(accKeyPath); os.IsNotExist(err) {
-		log.Printf("No key found for account %s. Generating a %s key.", s.userID, keyType)
+		log.Printf("No key found for account %s. Generating a %s key.", s.GetUserID(), keyType)
 		s.createKeysFolder()
 
 		privateKey, err := generatePrivateKey(accKeyPath, keyType)
 		if err != nil {
-			log.Fatalf("Could not generate RSA private account key for account %s: %v", s.userID, err)
+			log.Fatalf("Could not generate RSA private account key for account %s: %v", s.GetUserID(), err)
 		}
 
 		log.Printf("Saved key to %s", accKeyPath)
+
 		return privateKey
 	}
 
@@ -181,7 +193,7 @@ func (s *AccountsStorage) GetPrivateKey(keyType certcrypto.KeyType) crypto.Priva
 
 func (s *AccountsStorage) createKeysFolder() {
 	if err := createNonExistingFolder(s.keysPath); err != nil {
-		log.Fatalf("Could not check/create directory for account %s: %v", s.userID, err)
+		log.Fatalf("Could not check/create directory for account %s: %v", s.GetUserID(), err)
 	}
 }
 
@@ -198,6 +210,7 @@ func generatePrivateKey(file string, keyType certcrypto.KeyType) (crypto.Private
 	defer certOut.Close()
 
 	pemKey := certcrypto.PEMBlock(privateKey)
+
 	err = pem.Encode(certOut, pemKey)
 	if err != nil {
 		return nil, err
@@ -207,28 +220,24 @@ func generatePrivateKey(file string, keyType certcrypto.KeyType) (crypto.Private
 }
 
 func loadPrivateKey(file string) (crypto.PrivateKey, error) {
-	keyBytes, err := ioutil.ReadFile(file)
+	keyBytes, err := os.ReadFile(file)
 	if err != nil {
 		return nil, err
 	}
 
-	keyBlock, _ := pem.Decode(keyBytes)
-
-	switch keyBlock.Type {
-	case "RSA PRIVATE KEY":
-		return x509.ParsePKCS1PrivateKey(keyBlock.Bytes)
-	case "EC PRIVATE KEY":
-		return x509.ParseECPrivateKey(keyBlock.Bytes)
+	privateKey, err := certcrypto.ParsePEMPrivateKey(keyBytes)
+	if err != nil {
+		return nil, err
 	}
 
-	return nil, errors.New("unknown private key type")
+	return privateKey, nil
 }
 
 func tryRecoverRegistration(ctx *cli.Context, privateKey crypto.PrivateKey) (*registration.Resource, error) {
 	// couldn't load account but got a key. Try to look the account up.
 	config := lego.NewConfig(&Account{key: privateKey})
-	config.CADirURL = ctx.GlobalString("server")
-	config.UserAgent = fmt.Sprintf("lego-cli/%s", ctx.App.Version)
+	config.CADirURL = ctx.String(flgServer)
+	config.UserAgent = getUserAgent(ctx)
 
 	client, err := lego.NewClient(config)
 	if err != nil {
@@ -239,5 +248,6 @@ func tryRecoverRegistration(ctx *cli.Context, privateKey crypto.PrivateKey) (*re
 	if err != nil {
 		return nil, err
 	}
+
 	return reg, nil
 }

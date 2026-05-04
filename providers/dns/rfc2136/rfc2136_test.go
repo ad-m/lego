@@ -2,14 +2,13 @@ package rfc2136
 
 import (
 	"bytes"
-	"fmt"
-	"net"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
 	"github.com/go-acme/lego/v4/challenge/dns01"
+	"github.com/go-acme/lego/v4/platform/tester"
+	"github.com/go-acme/lego/v4/platform/tester/dnsmock"
 	"github.com/miekg/dns"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -18,7 +17,7 @@ import (
 const (
 	fakeDomain     = "123456789.www.example.com"
 	fakeKeyAuth    = "123d=="
-	fakeValue      = "Now36o-3BmlB623-0c1qCIUmgWVVmDJb88KGl24pqpo"
+	fakeValue      = "ADw2sEd82DUgXcQ9hNBZThJs7zVJkR5v9JeSbAb9mZY"
 	fakeFqdn       = "_acme-challenge.123456789.www.example.com."
 	fakeZone       = "example.com."
 	fakeTTL        = 120
@@ -26,39 +25,231 @@ const (
 	fakeTsigSecret = "IwBTJx9wrDp4Y1RyC3H0gA=="
 )
 
-func TestCanaryLocalTestServer(t *testing.T) {
-	dns01.ClearFqdnCache()
-	dns.HandleFunc("example.com.", serverHandlerHello)
-	defer dns.HandleRemove("example.com.")
+const envDomain = envNamespace + "DOMAIN"
 
-	server, addr, err := runLocalDNSTestServer(false)
-	require.NoError(t, err, "Failed to start test server")
-	defer func() { _ = server.Shutdown() }()
+var envTest = tester.NewEnvTest(
+	EnvTSIGFile,
+	EnvTSIGKey,
+	EnvTSIGSecret,
+	EnvTSIGAlgorithm,
+	EnvTSIGGSSRealm,
+	EnvTSIGGSSUsername,
+	EnvTSIGGSSPassword,
+	EnvTSIGGSSKeytabFile,
+	EnvNameserver,
+	EnvDNSTimeout,
+).WithDomain(envDomain)
 
-	c := new(dns.Client)
-	m := new(dns.Msg)
+func TestNewDNSProvider(t *testing.T) {
+	testCases := []struct {
+		desc     string
+		envVars  map[string]string
+		expected string
+	}{
+		{
+			desc: "success",
+			envVars: map[string]string{
+				EnvNameserver: "example.com",
+			},
+		},
+		{
+			desc: "missing nameserver",
+			envVars: map[string]string{
+				EnvNameserver: "",
+			},
+			expected: "dnsupdate: some credentials information are missing: DNSUPDATE_NAMESERVER",
+		},
+		{
+			desc: "invalid algorithm",
+			envVars: map[string]string{
+				EnvNameserver:    "example.com",
+				EnvTSIGKey:       "",
+				EnvTSIGSecret:    "",
+				EnvTSIGAlgorithm: "foo",
+			},
+			expected: "dnsupdate: unsupported TSIG algorithm: foo.",
+		},
+		{
+			desc: "valid TSIG file",
+			envVars: map[string]string{
+				EnvNameserver: "example.com",
+				EnvTSIGFile:   "./internal/fixtures/sample.conf",
+			},
+		},
+		{
+			desc: "invalid TSIG file",
+			envVars: map[string]string{
+				EnvNameserver: "example.com",
+				EnvTSIGFile:   "./internal/fixtures/invalid_key.conf",
+			},
+			expected: "dnsupdate: read TSIG file ./internal/fixtures/invalid_key.conf: invalid key line: key {",
+		},
+		{
+			desc: "TSIG GSS: password and keytab are mutually exclusive",
+			envVars: map[string]string{
+				EnvNameserver:        "example.com",
+				EnvTSIGAlgorithm:     "gss-tsig.",
+				EnvTSIGGSSRealm:      "example.org",
+				EnvTSIGGSSUsername:   "user",
+				EnvTSIGGSSPassword:   "secret",
+				EnvTSIGGSSKeytabFile: "/path/to/my.keytab",
+			},
+			expected: "dnsupdate: TSIG GSS: only one of the password and keytab paths can be set",
+		},
+		{
+			desc: "TSIG GSS: success with password",
+			envVars: map[string]string{
+				EnvNameserver:      "example.com",
+				EnvTSIGAlgorithm:   "gss-tsig.",
+				EnvTSIGGSSRealm:    "example.org",
+				EnvTSIGGSSUsername: "user",
+				EnvTSIGGSSPassword: "secret",
+			},
+		},
+		{
+			desc: "TSIG GSS: success with keytab",
+			envVars: map[string]string{
+				EnvNameserver:        "example.com",
+				EnvTSIGAlgorithm:     "gss-tsig.",
+				EnvTSIGGSSRealm:      "example.org",
+				EnvTSIGGSSUsername:   "user",
+				EnvTSIGGSSKeytabFile: "/path/to/my.keytab",
+			},
+		},
+	}
 
-	m.SetQuestion("example.com.", dns.TypeTXT)
+	for _, test := range testCases {
+		t.Run(test.desc, func(t *testing.T) {
+			defer envTest.RestoreEnv()
 
-	r, _, err := c.Exchange(m, addr)
-	require.NoError(t, err, "Failed to communicate with test server")
-	assert.Len(t, r.Extra, 1, "Failed to communicate with test server")
+			envTest.ClearEnv()
 
-	txt := r.Extra[0].(*dns.TXT).Txt[0]
-	assert.Equal(t, "Hello world", txt)
+			envTest.Apply(test.envVars)
+
+			p, err := NewDNSProvider()
+
+			if test.expected == "" {
+				require.NoError(t, err)
+				require.NotNil(t, p)
+				require.NotNil(t, p.config)
+			} else {
+				require.EqualError(t, err, test.expected)
+			}
+		})
+	}
 }
 
-func TestServerSuccess(t *testing.T) {
-	dns01.ClearFqdnCache()
-	dns.HandleFunc(fakeZone, serverHandlerReturnSuccess)
-	defer dns.HandleRemove(fakeZone)
+func TestNewDNSProviderConfig(t *testing.T) {
+	testCases := []struct {
+		desc       string
+		expected   string
+		nameserver string
 
-	server, addr, err := runLocalDNSTestServer(false)
-	require.NoError(t, err, "Failed to start test server")
-	defer func() { _ = server.Shutdown() }()
+		tsigFile      string
+		tsigAlgorithm string
+		tsigKey       string
+		tsigSecret    string
+
+		tsigGSSRealm      string
+		tsigGSSUsername   string
+		tsigGSSPassword   string
+		tsigGSSKeytabPath string
+	}{
+		{
+			desc:       "success",
+			nameserver: "example.com",
+		},
+		{
+			desc:     "missing nameserver",
+			expected: "dnsupdate: nameserver missing",
+		},
+		{
+			desc:          "invalid algorithm",
+			nameserver:    "example.com",
+			tsigAlgorithm: "foo",
+			expected:      "dnsupdate: unsupported TSIG algorithm: foo.",
+		},
+		{
+			desc:       "valid TSIG file",
+			nameserver: "example.com",
+			tsigFile:   "./internal/fixtures/sample.conf",
+		},
+		{
+			desc:       "invalid TSIG file",
+			nameserver: "example.com",
+			tsigFile:   "./internal/fixtures/invalid_key.conf",
+			expected:   "dnsupdate: read TSIG file ./internal/fixtures/invalid_key.conf: invalid key line: key {",
+		},
+		{
+			desc:              "TSIG GSS: password and keytab are mutually exclusive",
+			nameserver:        "example.com",
+			tsigAlgorithm:     "gss-tsig.",
+			tsigGSSRealm:      "example.org",
+			tsigGSSUsername:   "user",
+			tsigGSSPassword:   "secret",
+			tsigGSSKeytabPath: "/path/to/my.keytab",
+			expected:          "dnsupdate: TSIG GSS: only one of the password and keytab paths can be set",
+		},
+		{
+			desc:            "TSIG GSS: success with password",
+			nameserver:      "example.com",
+			tsigAlgorithm:   "gss-tsig.",
+			tsigGSSRealm:    "example.org",
+			tsigGSSUsername: "user",
+			tsigGSSPassword: "secret",
+		},
+		{
+			desc:              "TSIG GSS: success with keytab",
+			nameserver:        "example.com",
+			tsigAlgorithm:     "gss-tsig.",
+			tsigGSSRealm:      "example.org",
+			tsigGSSUsername:   "user",
+			tsigGSSKeytabPath: "/path/to/my.keytab",
+		},
+	}
+
+	for _, test := range testCases {
+		t.Run(test.desc, func(t *testing.T) {
+			config := NewDefaultConfig()
+			config.Nameserver = test.nameserver
+
+			config.TSIGFile = test.tsigFile
+			config.TSIGAlgorithm = test.tsigAlgorithm
+			config.TSIGKey = test.tsigKey
+			config.TSIGSecret = test.tsigSecret
+
+			config.TSIGGSSRealm = test.tsigGSSRealm
+			config.TSIGGSSUsername = test.tsigGSSUsername
+			config.TSIGGSSPassword = test.tsigGSSPassword
+			config.TSIGGSSKeytabFile = test.tsigGSSKeytabPath
+
+			p, err := NewDNSProviderConfig(config)
+
+			if test.expected == "" {
+				require.NoError(t, err)
+				require.NotNil(t, p)
+				require.NotNil(t, p.config)
+			} else {
+				require.EqualError(t, err, test.expected)
+			}
+		})
+	}
+}
+
+func TestDNSProvider_Present_success(t *testing.T) {
+	dns01.ClearFqdnCache()
+
+	defer envTest.RestoreEnv()
+
+	envTest.ClearEnv()
+
+	addr := dnsmock.NewServer().
+		Query(fakeZone+" SOA", dnsmock.SOA("")).
+		Update(fakeZone+" SOA", dnsmock.Noop).
+		Build(t)
 
 	config := NewDefaultConfig()
-	config.Nameserver = addr
+	config.Nameserver = addr.String()
 
 	provider, err := NewDNSProviderConfig(config)
 	require.NoError(t, err)
@@ -67,39 +258,110 @@ func TestServerSuccess(t *testing.T) {
 	require.NoError(t, err)
 }
 
-func TestServerError(t *testing.T) {
+func TestDNSProvider_Present_success_updatePacket(t *testing.T) {
 	dns01.ClearFqdnCache()
-	dns.HandleFunc(fakeZone, serverHandlerReturnErr)
-	defer dns.HandleRemove(fakeZone)
 
-	server, addr, err := runLocalDNSTestServer(false)
-	require.NoError(t, err, "Failed to start test server")
-	defer func() { _ = server.Shutdown() }()
+	defer envTest.RestoreEnv()
+
+	envTest.ClearEnv()
+
+	reqChan := make(chan *dns.Msg, 1)
+
+	addr := dnsmock.NewServer().
+		Query("_acme-challenge.123456789.www.example.com. SOA", dnsmock.SOA(fakeZone)).
+		Update(fakeZone+" SOA", func(w dns.ResponseWriter, req *dns.Msg) {
+			dnsmock.Noop(w, req)
+
+			// Only talk back when it is not the SOA RR.
+			reqChan <- req
+		}).
+		Build(t)
 
 	config := NewDefaultConfig()
-	config.Nameserver = addr
+	config.Nameserver = addr.String()
+
+	provider, err := NewDNSProviderConfig(config)
+	require.NoError(t, err)
+
+	err = provider.Present(fakeDomain, "", fakeKeyAuth)
+	require.NoError(t, err)
+
+	select {
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for request")
+
+	case rcvMsg := <-reqChan:
+		txtRR := &dns.TXT{
+			Hdr: dns.RR_Header{Name: fakeFqdn, Rrtype: dns.TypeTXT, Class: dns.ClassINET, Ttl: fakeTTL},
+			Txt: []string{fakeValue},
+		}
+
+		m := new(dns.Msg).SetUpdate(fakeZone)
+
+		m.RemoveRRset([]dns.RR{txtRR})
+		m.Insert([]dns.RR{txtRR})
+
+		expected, err := m.Pack()
+		require.NoError(t, err, "error packing")
+
+		rcvMsg.Id = m.Id
+
+		actual, err := rcvMsg.Pack()
+		require.NoError(t, err, "error packing")
+
+		if !bytes.Equal(actual, expected) {
+			tmp := new(dns.Msg)
+			require.NoError(t, tmp.Unpack(actual))
+
+			t.Errorf("Expected msg:\n%s", m)
+			t.Errorf("Actual msg:\n%s", tmp)
+		}
+	}
+}
+
+func TestDNSProvider_Present_error(t *testing.T) {
+	dns01.ClearFqdnCache()
+
+	defer envTest.RestoreEnv()
+
+	envTest.ClearEnv()
+
+	addr := dnsmock.NewServer().
+		Query(fakeZone+" SOA", dnsmock.Error(dns.RcodeNotZone)).
+		Build(t)
+
+	config := NewDefaultConfig()
+	config.Nameserver = addr.String()
 
 	provider, err := NewDNSProviderConfig(config)
 	require.NoError(t, err)
 
 	err = provider.Present(fakeDomain, "", fakeKeyAuth)
 	require.Error(t, err)
+
 	if !strings.Contains(err.Error(), "NOTZONE") {
-		t.Errorf("Expected Present() to return an error with the 'NOTZONE' rcode string but it did not: %v", err)
+		t.Errorf("Expected Present() to return an error with the 'NOTZONE' rcode string, but it did not: %v", err)
 	}
 }
 
-func TestTsigClient(t *testing.T) {
+func TestDNSProvider_Present_tsig_success(t *testing.T) {
 	dns01.ClearFqdnCache()
-	dns.HandleFunc(fakeZone, serverHandlerReturnSuccess)
-	defer dns.HandleRemove(fakeZone)
 
-	server, addr, err := runLocalDNSTestServer(true)
-	require.NoError(t, err, "Failed to start test server")
-	defer func() { _ = server.Shutdown() }()
+	defer envTest.RestoreEnv()
+
+	envTest.ClearEnv()
+
+	addr := dnsmock.NewServer().
+		Query(fakeZone+" SOA", dnsmock.SOA("")).
+		Update(fakeZone+" SOA", handleTSIG).
+		Build(t, func(server *dns.Server) error {
+			server.TsigSecret = map[string]string{fakeTsigKey: fakeTsigSecret}
+
+			return nil
+		})
 
 	config := NewDefaultConfig()
-	config.Nameserver = addr
+	config.Nameserver = addr.String()
 	config.TSIGKey = fakeTsigKey
 	config.TSIGSecret = fakeTsigSecret
 
@@ -110,143 +372,100 @@ func TestTsigClient(t *testing.T) {
 	require.NoError(t, err)
 }
 
-func TestValidUpdatePacket(t *testing.T) {
-	reqChan := make(chan *dns.Msg, 10)
-
+func TestDNSProvider_Present_tsig_error(t *testing.T) {
 	dns01.ClearFqdnCache()
-	dns.HandleFunc(fakeZone, serverHandlerPassBackRequest(reqChan))
-	defer dns.HandleRemove(fakeZone)
 
-	server, addr, err := runLocalDNSTestServer(false)
-	require.NoError(t, err, "Failed to start test server")
-	defer func() { _ = server.Shutdown() }()
+	defer envTest.RestoreEnv()
 
-	txtRR, _ := dns.NewRR(fmt.Sprintf("%s %d IN TXT %s", fakeFqdn, fakeTTL, fakeValue))
-	rrs := []dns.RR{txtRR}
-	m := new(dns.Msg)
-	m.SetUpdate(fakeZone)
-	m.RemoveRRset(rrs)
-	m.Insert(rrs)
-	expectStr := m.String()
+	envTest.ClearEnv()
 
-	expect, err := m.Pack()
-	require.NoError(t, err, "error packing")
+	addr := dnsmock.NewServer().
+		Query(fakeZone+" SOA", dnsmock.SOA("")).
+		Update(fakeZone+" SOA", handleTSIG).
+		Build(t, func(server *dns.Server) error {
+			server.TsigSecret = map[string]string{"example.org": fakeTsigSecret}
+
+			return nil
+		})
 
 	config := NewDefaultConfig()
-	config.Nameserver = addr
+	config.Nameserver = addr.String()
+	config.TSIGKey = fakeTsigKey
+	config.TSIGSecret = fakeTsigSecret
 
 	provider, err := NewDNSProviderConfig(config)
 	require.NoError(t, err)
 
-	err = provider.Present(fakeDomain, "", "1234d==")
-	require.NoError(t, err)
+	err = provider.Present(fakeDomain, "", fakeKeyAuth)
+	require.Error(t, err)
 
-	rcvMsg := <-reqChan
-	rcvMsg.Id = m.Id
-
-	actual, err := rcvMsg.Pack()
-	require.NoError(t, err, "error packing")
-
-	if !bytes.Equal(actual, expect) {
-		tmp := new(dns.Msg)
-		if err := tmp.Unpack(actual); err != nil {
-			t.Fatalf("Error unpacking actual msg: %v", err)
-		}
-		t.Errorf("Expected msg:\n%s", expectStr)
-		t.Errorf("Actual msg:\n%v", tmp)
-	}
+	require.EqualError(t, err,
+		"dnsupdate: failed to insert: DNS update failed: "+
+			"server "+addr.String()+" replied NOTZONE for INSERT _acme-challenge.123456789.www.example.com.")
 }
 
-func runLocalDNSTestServer(tsig bool) (*dns.Server, string, error) {
-	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
-	if err != nil {
-		return nil, "", err
+func handleTSIG(w dns.ResponseWriter, req *dns.Msg) {
+	m := new(dns.Msg)
+
+	tsig := req.IsTsig()
+	if tsig == nil {
+		_ = w.WriteMsg(m.SetRcode(req, dns.RcodeRefused))
+		return
 	}
 
-	server := &dns.Server{
-		PacketConn:   pc,
-		ReadTimeout:  time.Hour,
-		WriteTimeout: time.Hour,
-		MsgAcceptFunc: func(dh dns.Header) dns.MsgAcceptAction {
-			// bypass defaultMsgAcceptFunc to allow dynamic update (https://github.com/miekg/dns/pull/830)
-			return dns.MsgAccept
+	err := w.TsigStatus()
+	if err != nil {
+		_ = w.WriteMsg(m.SetRcode(req, dns.RcodeNotZone))
+
+		return
+	}
+
+	// Validated
+	_ = w.WriteMsg(m.
+		SetReply(req).
+		SetTsig(tsig.Hdr.Name, tsig.Algorithm, tsig.Fudge, time.Now().Unix()),
+	)
+}
+
+func TestProvider_findZone(t *testing.T) {
+	p, err := NewDNSProviderConfig(&Config{
+		Nameserver: "example.com",
+		Zones: []string{
+			"example.com", "example.org", "foo.example.com",
+		},
+	})
+	require.NoError(t, err)
+
+	testCases := []struct {
+		desc     string
+		fqdn     string
+		expected string
+	}{
+		{
+			desc:     "exact match",
+			fqdn:     "example.com.",
+			expected: "example.com.",
+		},
+		{
+			desc:     "subdomain match",
+			fqdn:     "bar.example.com.",
+			expected: "example.com.",
+		},
+		{
+			desc:     "subdomain of subdomain match",
+			fqdn:     "bar.foo.example.com.",
+			expected: "foo.example.com.",
 		},
 	}
 
-	if tsig {
-		server.TsigSecret = map[string]string{fakeTsigKey: fakeTsigSecret}
-	}
+	for _, test := range testCases {
+		t.Run(test.desc, func(t *testing.T) {
+			t.Parallel()
 
-	waitLock := sync.Mutex{}
-	waitLock.Lock()
-	server.NotifyStartedFunc = waitLock.Unlock
+			zone, err := p.findZone(test.fqdn)
+			require.NoError(t, err)
 
-	go func() {
-		_ = server.ActivateAndServe()
-		pc.Close()
-	}()
-
-	waitLock.Lock()
-	return server, pc.LocalAddr().String(), nil
-}
-
-func serverHandlerHello(w dns.ResponseWriter, req *dns.Msg) {
-	m := new(dns.Msg)
-	m.SetReply(req)
-	m.Extra = make([]dns.RR, 1)
-	m.Extra[0] = &dns.TXT{
-		Hdr: dns.RR_Header{Name: m.Question[0].Name, Rrtype: dns.TypeTXT, Class: dns.ClassINET, Ttl: 0},
-		Txt: []string{"Hello world"},
-	}
-	_ = w.WriteMsg(m)
-}
-
-func serverHandlerReturnSuccess(w dns.ResponseWriter, req *dns.Msg) {
-	m := new(dns.Msg)
-	m.SetReply(req)
-	if req.Opcode == dns.OpcodeQuery && req.Question[0].Qtype == dns.TypeSOA && req.Question[0].Qclass == dns.ClassINET {
-		// Return SOA to appease findZoneByFqdn()
-		soaRR, _ := dns.NewRR(fmt.Sprintf("%s %d IN SOA ns1.%s admin.%s 2016022801 28800 7200 2419200 1200", fakeZone, fakeTTL, fakeZone, fakeZone))
-		m.Answer = []dns.RR{soaRR}
-	}
-
-	if t := req.IsTsig(); t != nil {
-		if w.TsigStatus() == nil {
-			// Validated
-			m.SetTsig(fakeZone, dns.HmacSHA1, 300, time.Now().Unix())
-		}
-	}
-
-	_ = w.WriteMsg(m)
-}
-
-func serverHandlerReturnErr(w dns.ResponseWriter, req *dns.Msg) {
-	m := new(dns.Msg)
-	m.SetRcode(req, dns.RcodeNotZone)
-	_ = w.WriteMsg(m)
-}
-
-func serverHandlerPassBackRequest(reqChan chan *dns.Msg) func(w dns.ResponseWriter, req *dns.Msg) {
-	return func(w dns.ResponseWriter, req *dns.Msg) {
-		m := new(dns.Msg)
-		m.SetReply(req)
-		if req.Opcode == dns.OpcodeQuery && req.Question[0].Qtype == dns.TypeSOA && req.Question[0].Qclass == dns.ClassINET {
-			// Return SOA to appease findZoneByFqdn()
-			soaRR, _ := dns.NewRR(fmt.Sprintf("%s %d IN SOA ns1.%s admin.%s 2016022801 28800 7200 2419200 1200", fakeZone, fakeTTL, fakeZone, fakeZone))
-			m.Answer = []dns.RR{soaRR}
-		}
-
-		if t := req.IsTsig(); t != nil {
-			if w.TsigStatus() == nil {
-				// Validated
-				m.SetTsig(fakeZone, dns.HmacSHA1, 300, time.Now().Unix())
-			}
-		}
-
-		_ = w.WriteMsg(m)
-		if req.Opcode != dns.OpcodeQuery || req.Question[0].Qtype != dns.TypeSOA || req.Question[0].Qclass != dns.ClassINET {
-			// Only talk back when it is not the SOA RR.
-			reqChan <- req
-		}
+			assert.Equal(t, test.expected, zone)
+		})
 	}
 }

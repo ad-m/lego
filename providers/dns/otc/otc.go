@@ -2,20 +2,18 @@
 package otc
 
 import (
+	"context"
 	"errors"
 	"fmt"
-	"net"
 	"net/http"
 	"time"
 
+	"github.com/go-acme/lego/v4/challenge"
 	"github.com/go-acme/lego/v4/challenge/dns01"
 	"github.com/go-acme/lego/v4/platform/config/env"
+	"github.com/go-acme/lego/v4/providers/dns/internal/clientdebug"
+	"github.com/go-acme/lego/v4/providers/dns/otc/internal"
 )
-
-const defaultIdentityEndpoint = "https://iam.eu-de.otc.t-systems.com:443/v3/auth/tokens"
-
-// minTTL 300 is otc minimum value for TTL.
-const minTTL = 300
 
 // Environment variables names.
 const (
@@ -26,59 +24,69 @@ const (
 	EnvPassword         = envNamespace + "PASSWORD"
 	EnvProjectName      = envNamespace + "PROJECT_NAME"
 	EnvIdentityEndpoint = envNamespace + "IDENTITY_ENDPOINT"
+	EnvPrivateZone      = envNamespace + "PRIVATE_ZONE"
 
 	EnvTTL                = envNamespace + "TTL"
 	EnvPropagationTimeout = envNamespace + "PROPAGATION_TIMEOUT"
 	EnvPollingInterval    = envNamespace + "POLLING_INTERVAL"
 	EnvHTTPTimeout        = envNamespace + "HTTP_TIMEOUT"
+	EnvSequenceInterval   = envNamespace + "SEQUENCE_INTERVAL"
 )
+
+const defaultIdentityEndpoint = "https://iam.eu-de.otc.t-systems.com:443/v3/auth/tokens"
+
+// minTTL 300 is otc minimum value for TTL.
+const minTTL = 300
+
+var _ challenge.ProviderTimeout = (*DNSProvider)(nil)
 
 // Config is used to configure the creation of the DNSProvider.
 type Config struct {
-	IdentityEndpoint   string
-	DomainName         string
-	ProjectName        string
-	UserName           string
-	Password           string
+	DomainName       string
+	ProjectName      string
+	UserName         string
+	Password         string
+	IdentityEndpoint string
+	PrivateZone      bool
+
 	PropagationTimeout time.Duration
 	PollingInterval    time.Duration
+	SequenceInterval   time.Duration
 	TTL                int
 	HTTPClient         *http.Client
 }
 
 // NewDefaultConfig returns a default configuration for the DNSProvider.
 func NewDefaultConfig() *Config {
+	tr := &http.Transport{}
+
+	defaultTransport, ok := http.DefaultTransport.(*http.Transport)
+	if ok {
+		tr = defaultTransport.Clone()
+	}
+
+	// Workaround for keep alive bug in otc api
+	tr.DisableKeepAlives = true
+
 	return &Config{
+		PrivateZone:      env.GetOrDefaultBool(EnvPrivateZone, false),
+		IdentityEndpoint: env.GetOrDefaultString(EnvIdentityEndpoint, defaultIdentityEndpoint),
+
 		TTL:                env.GetOrDefaultInt(EnvTTL, minTTL),
 		PropagationTimeout: env.GetOrDefaultSecond(EnvPropagationTimeout, dns01.DefaultPropagationTimeout),
 		PollingInterval:    env.GetOrDefaultSecond(EnvPollingInterval, dns01.DefaultPollingInterval),
-		IdentityEndpoint:   env.GetOrDefaultString(EnvIdentityEndpoint, defaultIdentityEndpoint),
+		SequenceInterval:   env.GetOrDefaultSecond(EnvSequenceInterval, dns01.DefaultPropagationTimeout),
 		HTTPClient: &http.Client{
-			Timeout: env.GetOrDefaultSecond(EnvHTTPTimeout, 10*time.Second),
-			Transport: &http.Transport{
-				Proxy: http.ProxyFromEnvironment,
-				DialContext: (&net.Dialer{
-					Timeout:   30 * time.Second,
-					KeepAlive: 30 * time.Second,
-					DualStack: true,
-				}).DialContext,
-				MaxIdleConns:          100,
-				IdleConnTimeout:       90 * time.Second,
-				TLSHandshakeTimeout:   10 * time.Second,
-				ExpectContinueTimeout: 1 * time.Second,
-
-				// Workaround for keep alive bug in otc api
-				DisableKeepAlives: true,
-			},
+			Timeout:   env.GetOrDefaultSecond(EnvHTTPTimeout, 10*time.Second),
+			Transport: tr,
 		},
 	}
 }
 
 // DNSProvider implements the challenge.Provider interface.
 type DNSProvider struct {
-	config  *Config
-	baseURL string
-	token   string
+	config *Config
+	client *internal.Client
 }
 
 // NewDNSProvider returns a DNSProvider instance configured for OTC DNS.
@@ -113,77 +121,89 @@ func NewDNSProviderConfig(config *Config) (*DNSProvider, error) {
 		return nil, fmt.Errorf("otc: invalid TTL, TTL (%d) must be greater than %d", config.TTL, minTTL)
 	}
 
-	if config.IdentityEndpoint == "" {
-		config.IdentityEndpoint = defaultIdentityEndpoint
+	client := internal.NewClient(config.UserName, config.Password, config.DomainName, config.ProjectName)
+
+	if config.IdentityEndpoint != "" {
+		client.IdentityEndpoint = config.IdentityEndpoint
 	}
 
-	return &DNSProvider{config: config}, nil
+	if config.HTTPClient != nil {
+		client.HTTPClient = config.HTTPClient
+	}
+
+	client.HTTPClient = clientdebug.Wrap(client.HTTPClient)
+
+	return &DNSProvider{config: config, client: client}, nil
 }
 
 // Present creates a TXT record using the specified parameters.
 func (d *DNSProvider) Present(domain, token, keyAuth string) error {
-	fqdn, value := dns01.GetRecord(domain, keyAuth)
+	info := dns01.GetChallengeInfo(domain, keyAuth)
 
-	authZone, err := dns01.FindZoneByFqdn(fqdn)
+	authZone, err := dns01.FindZoneByFqdn(info.EffectiveFQDN)
+	if err != nil {
+		return fmt.Errorf("otc: could not find zone for domain %q: %w", domain, err)
+	}
+
+	ctx := context.Background()
+
+	err = d.client.Login(ctx)
 	if err != nil {
 		return fmt.Errorf("otc: %w", err)
 	}
 
-	err = d.login()
-	if err != nil {
-		return fmt.Errorf("otc: %w", err)
-	}
-
-	zoneID, err := d.getZoneID(authZone)
+	zoneID, err := d.client.GetZoneID(ctx, authZone, d.config.PrivateZone)
 	if err != nil {
 		return fmt.Errorf("otc: unable to get zone: %w", err)
 	}
 
-	resource := fmt.Sprintf("zones/%s/recordsets", zoneID)
-
-	r1 := &recordset{
-		Name:        fqdn,
+	record := internal.RecordSets{
+		Name:        info.EffectiveFQDN,
 		Description: "Added TXT record for ACME dns-01 challenge using lego client",
 		Type:        "TXT",
 		TTL:         d.config.TTL,
-		Records:     []string{fmt.Sprintf("\"%s\"", value)},
+		Records:     []string{fmt.Sprintf("%q", info.Value)},
 	}
 
-	_, err = d.sendRequest(http.MethodPost, resource, r1)
+	err = d.client.CreateRecordSet(ctx, zoneID, record)
 	if err != nil {
 		return fmt.Errorf("otc: %w", err)
 	}
+
 	return nil
 }
 
 // CleanUp removes the TXT record matching the specified parameters.
 func (d *DNSProvider) CleanUp(domain, token, keyAuth string) error {
-	fqdn, _ := dns01.GetRecord(domain, keyAuth)
+	info := dns01.GetChallengeInfo(domain, keyAuth)
 
-	authZone, err := dns01.FindZoneByFqdn(fqdn)
+	authZone, err := dns01.FindZoneByFqdn(info.EffectiveFQDN)
+	if err != nil {
+		return fmt.Errorf("otc: could not find zone for domain %q: %w", domain, err)
+	}
+
+	ctx := context.Background()
+
+	err = d.client.Login(ctx)
 	if err != nil {
 		return fmt.Errorf("otc: %w", err)
 	}
 
-	err = d.login()
+	zoneID, err := d.client.GetZoneID(ctx, authZone, d.config.PrivateZone)
 	if err != nil {
 		return fmt.Errorf("otc: %w", err)
 	}
 
-	zoneID, err := d.getZoneID(authZone)
+	recordID, err := d.client.GetRecordSetID(ctx, zoneID, info.EffectiveFQDN)
+	if err != nil {
+		return fmt.Errorf("otc: unable to get record %s for zone %s: %w", info.EffectiveFQDN, domain, err)
+	}
+
+	err = d.client.DeleteRecordSet(ctx, zoneID, recordID)
 	if err != nil {
 		return fmt.Errorf("otc: %w", err)
 	}
 
-	recordID, err := d.getRecordSetID(zoneID, fqdn)
-	if err != nil {
-		return fmt.Errorf("otc: unable go get record %s for zone %s: %w", fqdn, domain, err)
-	}
-
-	err = d.deleteRecordSet(zoneID, recordID)
-	if err != nil {
-		return fmt.Errorf("otc: %w", err)
-	}
 	return nil
 }
 
@@ -191,4 +211,10 @@ func (d *DNSProvider) CleanUp(domain, token, keyAuth string) error {
 // Adjusting here to cope with spikes in propagation times.
 func (d *DNSProvider) Timeout() (timeout, interval time.Duration) {
 	return d.config.PropagationTimeout, d.config.PollingInterval
+}
+
+// Sequential All DNS challenges for this provider will be resolved sequentially.
+// Returns the interval between each iteration.
+func (d *DNSProvider) Sequential() time.Duration {
+	return d.config.SequenceInterval
 }

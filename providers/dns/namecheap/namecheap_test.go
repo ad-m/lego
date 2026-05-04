@@ -1,13 +1,10 @@
 package namecheap
 
 import (
-	"fmt"
-	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"testing"
-	"time"
 
+	"github.com/go-acme/lego/v4/platform/tester/servermock"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -18,79 +15,66 @@ const (
 	envTestClientIP = "10.0.0.1"
 )
 
-func TestDNSProvider_getHosts(t *testing.T) {
-	for _, test := range testCases {
-		t.Run(test.name, func(t *testing.T) {
-			serverURL := mockServer(t, &test)
-
-			provider := mockDNSProvider(serverURL)
-
-			ch, err := newChallenge(test.domain, "")
-			require.NoError(t, err)
-
-			hosts, err := provider.getHosts(ch.sld, ch.tld)
-			if test.errString != "" {
-				assert.EqualError(t, err, test.errString)
-			} else {
-				assert.NoError(t, err)
-			}
-
-		next1:
-			for _, h := range hosts {
-				for _, th := range test.hosts {
-					if h == th {
-						continue next1
-					}
-				}
-				t.Errorf("getHosts case %s unexpected record [%s:%s:%s]", test.name, h.Type, h.Name, h.Address)
-			}
-
-		next2:
-			for _, th := range test.hosts {
-				for _, h := range hosts {
-					if h == th {
-						continue next2
-					}
-				}
-				t.Errorf("getHosts case %s missing record [%s:%s:%s]", test.name, th.Type, th.Name, th.Address)
-			}
-		})
-	}
+type testCase struct {
+	name             string
+	domain           string
+	errString        string
+	getHostsResponse string
+	setHostsResponse string
 }
 
-func TestDNSProvider_setHosts(t *testing.T) {
-	for _, test := range testCases {
-		t.Run(test.name, func(t *testing.T) {
-			serverURL := mockServer(t, &test)
-
-			prov := mockDNSProvider(serverURL)
-
-			ch, err := newChallenge(test.domain, "")
-			require.NoError(t, err)
-
-			hosts, err := prov.getHosts(ch.sld, ch.tld)
-			if test.errString != "" {
-				assert.EqualError(t, err, test.errString)
-			} else {
-				require.NoError(t, err)
-			}
-			if err != nil {
-				return
-			}
-
-			err = prov.setHosts(ch.sld, ch.tld, hosts)
-			require.NoError(t, err)
-		})
-	}
+var testCases = []testCase{
+	{
+		name:             "Test:Success:1",
+		domain:           "test.example.com",
+		getHostsResponse: "getHosts_success1.xml",
+		setHostsResponse: "setHosts_success1.xml",
+	},
+	{
+		name:             "Test:Success:2",
+		domain:           "example.com",
+		getHostsResponse: "getHosts_success2.xml",
+		setHostsResponse: "setHosts_success2.xml",
+	},
+	{
+		name:             "Test:Error:BadApiKey:1",
+		domain:           "test.example.com",
+		errString:        "API Key is invalid or API access has not been enabled [1011102]",
+		getHostsResponse: "getHosts_errorBadAPIKey1.xml",
+	},
 }
 
 func TestDNSProvider_Present(t *testing.T) {
 	for _, test := range testCases {
 		t.Run(test.name, func(t *testing.T) {
-			serverURL := mockServer(t, &test)
+			ch, _ := newPseudoRecord(test.domain, "")
 
-			prov := mockDNSProvider(serverURL)
-			err := prov.Present(test.domain, "", "dummyKey")
+			provider := mockBuilder().
+				Route("GET /",
+					servermock.ResponseFromInternal(test.getHostsResponse),
+					servermock.CheckForm().Strict().
+						With("ClientIp", "10.0.0.1").
+						With("Command", "namecheap.domains.dns.getHosts").
+						With("SLD", ch.sld).
+						With("TLD", ch.tld).
+						With("UserName", "foo").
+						With("ApiKey", "bar").
+						With("ApiUser", "foo"),
+				).
+				Route("POST /",
+					servermock.ResponseFromInternal(test.setHostsResponse),
+					servermock.CheckForm().
+						With("ClientIp", "10.0.0.1").
+						With("Command", "namecheap.domains.dns.setHosts").
+						With("SLD", ch.sld).
+						With("TLD", ch.tld).
+						With("UserName", "foo").
+						With("ApiKey", "bar").
+						With("ApiUser", "foo"),
+				).
+				Build(t)
+
+			err := provider.Present(test.domain, "", "dummyKey")
 			if test.errString != "" {
 				assert.EqualError(t, err, "namecheap: "+test.errString)
 			} else {
@@ -103,10 +87,34 @@ func TestDNSProvider_Present(t *testing.T) {
 func TestDNSProvider_CleanUp(t *testing.T) {
 	for _, test := range testCases {
 		t.Run(test.name, func(t *testing.T) {
-			serverURL := mockServer(t, &test)
+			ch, _ := newPseudoRecord(test.domain, "")
 
-			prov := mockDNSProvider(serverURL)
-			err := prov.CleanUp(test.domain, "", "dummyKey")
+			provider := mockBuilder().
+				Route("GET /",
+					servermock.ResponseFromInternal(test.getHostsResponse),
+					servermock.CheckForm().Strict().
+						With("ClientIp", "10.0.0.1").
+						With("Command", "namecheap.domains.dns.getHosts").
+						With("SLD", ch.sld).
+						With("TLD", ch.tld).
+						With("UserName", "foo").
+						With("ApiKey", "bar").
+						With("ApiUser", "foo"),
+				).
+				Route("POST /",
+					servermock.ResponseFromInternal(test.setHostsResponse),
+					servermock.CheckForm().
+						With("ClientIp", "10.0.0.1").
+						With("Command", "namecheap.domains.dns.setHosts").
+						With("SLD", ch.sld).
+						With("TLD", ch.tld).
+						With("UserName", "foo").
+						With("ApiKey", "bar").
+						With("ApiUser", "foo"),
+				).
+				Build(t)
+
+			err := provider.CleanUp(test.domain, "", "dummyKey")
 			if test.errString != "" {
 				assert.EqualError(t, err, "namecheap: "+test.errString)
 			} else {
@@ -116,7 +124,7 @@ func TestDNSProvider_CleanUp(t *testing.T) {
 	}
 }
 
-func TestDomainSplit(t *testing.T) {
+func Test_newPseudoRecord_domainSplit(t *testing.T) {
 	tests := []struct {
 		domain string
 		valid  bool
@@ -142,10 +150,10 @@ func TestDomainSplit(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		test := test
 		t.Run(test.domain, func(t *testing.T) {
 			valid := true
-			ch, err := newChallenge(test.domain, "")
+
+			ch, err := newPseudoRecord(test.domain, "")
 			if err != nil {
 				valid = false
 			}
@@ -167,193 +175,15 @@ func TestDomainSplit(t *testing.T) {
 	}
 }
 
-func assertHdr(t *testing.T, tc *testCase, values *url.Values) {
-	t.Helper()
+func mockBuilder() *servermock.Builder[*DNSProvider] {
+	return servermock.NewBuilder(func(server *httptest.Server) (*DNSProvider, error) {
+		config := NewDefaultConfig()
+		config.HTTPClient = server.Client()
+		config.BaseURL = server.URL
+		config.APIUser = envTestUser
+		config.APIKey = envTestKey
+		config.ClientIP = envTestClientIP
 
-	ch, _ := newChallenge(tc.domain, "")
-	assert.Equal(t, envTestUser, values.Get("ApiUser"), "ApiUser")
-	assert.Equal(t, envTestKey, values.Get("ApiKey"), "ApiKey")
-	assert.Equal(t, envTestUser, values.Get("UserName"), "UserName")
-	assert.Equal(t, envTestClientIP, values.Get("ClientIp"), "ClientIp")
-	assert.Equal(t, ch.sld, values.Get("SLD"), "SLD")
-	assert.Equal(t, ch.tld, values.Get("TLD"), "TLD")
+		return NewDNSProviderConfig(config)
+	})
 }
-
-func mockServer(t *testing.T, tc *testCase) string {
-	t.Helper()
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.Method {
-		case http.MethodGet:
-			values := r.URL.Query()
-			cmd := values.Get("Command")
-			switch cmd {
-			case "namecheap.domains.dns.getHosts":
-				assertHdr(t, tc, &values)
-				w.WriteHeader(http.StatusOK)
-				fmt.Fprint(w, tc.getHostsResponse)
-			default:
-				t.Errorf("Unexpected GET command: %s", cmd)
-			}
-
-		case http.MethodPost:
-			err := r.ParseForm()
-			if err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return
-			}
-			values := r.Form
-			cmd := values.Get("Command")
-			switch cmd {
-			case "namecheap.domains.dns.setHosts":
-				assertHdr(t, tc, &values)
-				w.WriteHeader(http.StatusOK)
-				fmt.Fprint(w, tc.setHostsResponse)
-			default:
-				t.Errorf("Unexpected POST command: %s", cmd)
-			}
-
-		default:
-			t.Errorf("Unexpected http method: %s", r.Method)
-		}
-	}))
-
-	t.Cleanup(server.Close)
-
-	return server.URL
-}
-
-func mockDNSProvider(baseURL string) *DNSProvider {
-	config := NewDefaultConfig()
-	config.BaseURL = baseURL
-	config.APIUser = envTestUser
-	config.APIKey = envTestKey
-	config.ClientIP = envTestClientIP
-	config.HTTPClient = &http.Client{Timeout: 60 * time.Second}
-
-	provider, err := NewDNSProviderConfig(config)
-	if err != nil {
-		panic(err)
-	}
-	return provider
-}
-
-type testCase struct {
-	name             string
-	domain           string
-	hosts            []Record
-	errString        string
-	getHostsResponse string
-	setHostsResponse string
-}
-
-var testCases = []testCase{
-	{
-		name:   "Test:Success:1",
-		domain: "test.example.com",
-		hosts: []Record{
-			{Type: "A", Name: "home", Address: "10.0.0.1", MXPref: "10", TTL: "1799"},
-			{Type: "A", Name: "www", Address: "10.0.0.2", MXPref: "10", TTL: "1200"},
-			{Type: "AAAA", Name: "a", Address: "::0", MXPref: "10", TTL: "1799"},
-			{Type: "CNAME", Name: "*", Address: "example.com.", MXPref: "10", TTL: "1799"},
-			{Type: "MXE", Name: "example.com", Address: "10.0.0.5", MXPref: "10", TTL: "1800"},
-			{Type: "URL", Name: "xyz", Address: "https://google.com", MXPref: "10", TTL: "1799"},
-		},
-		getHostsResponse: responseGetHostsSuccess1,
-		setHostsResponse: responseSetHostsSuccess1,
-	},
-	{
-		name:   "Test:Success:2",
-		domain: "example.com",
-		hosts: []Record{
-			{Type: "A", Name: "@", Address: "10.0.0.2", MXPref: "10", TTL: "1200"},
-			{Type: "A", Name: "www", Address: "10.0.0.3", MXPref: "10", TTL: "60"},
-		},
-		getHostsResponse: responseGetHostsSuccess2,
-		setHostsResponse: responseSetHostsSuccess2,
-	},
-	{
-		name:             "Test:Error:BadApiKey:1",
-		domain:           "test.example.com",
-		errString:        "API Key is invalid or API access has not been enabled [1011102]",
-		getHostsResponse: responseGetHostsErrorBadAPIKey1,
-	},
-}
-
-const responseGetHostsSuccess1 = `<?xml version="1.0" encoding="utf-8"?>
-<ApiResponse Status="OK" xmlns="http://api.namecheap.com/xml.response">
-  <Errors />
-  <Warnings />
-  <RequestedCommand>namecheap.domains.dns.getHosts</RequestedCommand>
-  <CommandResponse Type="namecheap.domains.dns.getHosts">
-    <DomainDNSGetHostsResult Domain="example.com" EmailType="MXE" IsUsingOurDNS="true">
-      <host HostId="217076" Name="www" Type="A" Address="10.0.0.2" MXPref="10" TTL="1200" AssociatedAppTitle="" FriendlyName="" IsActive="true" IsDDNSEnabled="false" />
-      <host HostId="217069" Name="home" Type="A" Address="10.0.0.1" MXPref="10" TTL="1799" AssociatedAppTitle="" FriendlyName="" IsActive="true" IsDDNSEnabled="false" />
-      <host HostId="217071" Name="a" Type="AAAA" Address="::0" MXPref="10" TTL="1799" AssociatedAppTitle="" FriendlyName="" IsActive="true" IsDDNSEnabled="false" />
-      <host HostId="217075" Name="*" Type="CNAME" Address="example.com." MXPref="10" TTL="1799" AssociatedAppTitle="" FriendlyName="" IsActive="true" IsDDNSEnabled="false" />
-      <host HostId="217073" Name="example.com" Type="MXE" Address="10.0.0.5" MXPref="10" TTL="1800" AssociatedAppTitle="MXE" FriendlyName="MXE1" IsActive="true" IsDDNSEnabled="false" />
-      <host HostId="217077" Name="xyz" Type="URL" Address="https://google.com" MXPref="10" TTL="1799" AssociatedAppTitle="" FriendlyName="" IsActive="true" IsDDNSEnabled="false" />
-    </DomainDNSGetHostsResult>
-  </CommandResponse>
-  <Server>PHX01SBAPI01</Server>
-  <GMTTimeDifference>--5:00</GMTTimeDifference>
-  <ExecutionTime>3.338</ExecutionTime>
-</ApiResponse>`
-
-const responseSetHostsSuccess1 = `<?xml version="1.0" encoding="utf-8"?>
-<ApiResponse Status="OK" xmlns="http://api.namecheap.com/xml.response">
-  <Errors />
-  <Warnings />
-  <RequestedCommand>namecheap.domains.dns.setHosts</RequestedCommand>
-  <CommandResponse Type="namecheap.domains.dns.setHosts">
-    <DomainDNSSetHostsResult Domain="example.com" IsSuccess="true">
-      <Warnings />
-    </DomainDNSSetHostsResult>
-  </CommandResponse>
-  <Server>PHX01SBAPI01</Server>
-  <GMTTimeDifference>--5:00</GMTTimeDifference>
-  <ExecutionTime>2.347</ExecutionTime>
-</ApiResponse>`
-
-const responseGetHostsSuccess2 = `<?xml version="1.0" encoding="utf-8"?>
-<ApiResponse Status="OK" xmlns="http://api.namecheap.com/xml.response">
-  <Errors />
-  <Warnings />
-  <RequestedCommand>namecheap.domains.dns.getHosts</RequestedCommand>
-  <CommandResponse Type="namecheap.domains.dns.getHosts">
-    <DomainDNSGetHostsResult Domain="example.com" EmailType="MXE" IsUsingOurDNS="true">
-      <host HostId="217076" Name="@" Type="A" Address="10.0.0.2" MXPref="10" TTL="1200" AssociatedAppTitle="" FriendlyName="" IsActive="true" IsDDNSEnabled="false" />
-      <host HostId="217069" Name="www" Type="A" Address="10.0.0.3" MXPref="10" TTL="60" AssociatedAppTitle="" FriendlyName="" IsActive="true" IsDDNSEnabled="false" />
-    </DomainDNSGetHostsResult>
-  </CommandResponse>
-  <Server>PHX01SBAPI01</Server>
-  <GMTTimeDifference>--5:00</GMTTimeDifference>
-  <ExecutionTime>3.338</ExecutionTime>
-</ApiResponse>`
-
-const responseSetHostsSuccess2 = `<?xml version="1.0" encoding="utf-8"?>
-<ApiResponse Status="OK" xmlns="http://api.namecheap.com/xml.response">
-  <Errors />
-  <Warnings />
-  <RequestedCommand>namecheap.domains.dns.setHosts</RequestedCommand>
-  <CommandResponse Type="namecheap.domains.dns.setHosts">
-    <DomainDNSSetHostsResult Domain="example.com" IsSuccess="true">
-      <Warnings />
-    </DomainDNSSetHostsResult>
-  </CommandResponse>
-  <Server>PHX01SBAPI01</Server>
-  <GMTTimeDifference>--5:00</GMTTimeDifference>
-  <ExecutionTime>2.347</ExecutionTime>
-</ApiResponse>`
-
-const responseGetHostsErrorBadAPIKey1 = `<?xml version="1.0" encoding="utf-8"?>
-<ApiResponse Status="ERROR" xmlns="http://api.namecheap.com/xml.response">
-  <Errors>
-    <Error Number="1011102">API Key is invalid or API access has not been enabled</Error>
-  </Errors>
-  <Warnings />
-  <RequestedCommand />
-  <Server>PHX01SBAPI01</Server>
-  <GMTTimeDifference>--5:00</GMTTimeDifference>
-  <ExecutionTime>0</ExecutionTime>
-</ApiResponse>`

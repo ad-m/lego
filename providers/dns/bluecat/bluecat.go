@@ -2,23 +2,18 @@
 package bluecat
 
 import (
-	"encoding/json"
+	"context"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"net/http"
-	"strconv"
 	"time"
 
+	"github.com/go-acme/lego/v4/challenge"
 	"github.com/go-acme/lego/v4/challenge/dns01"
+	"github.com/go-acme/lego/v4/log"
 	"github.com/go-acme/lego/v4/platform/config/env"
-)
-
-const (
-	configType = "Configuration"
-	viewType   = "View"
-	zoneType   = "Zone"
-	txtType    = "TXTRecord"
+	"github.com/go-acme/lego/v4/providers/dns/bluecat/internal"
+	"github.com/go-acme/lego/v4/providers/dns/internal/clientdebug"
 )
 
 // Environment variables names.
@@ -30,12 +25,16 @@ const (
 	EnvPassword   = envNamespace + "PASSWORD"
 	EnvConfigName = envNamespace + "CONFIG_NAME"
 	EnvDNSView    = envNamespace + "DNS_VIEW"
+	EnvDebug      = envNamespace + "DEBUG"
+	EnvSkipDeploy = envNamespace + "SKIP_DEPLOY"
 
 	EnvTTL                = envNamespace + "TTL"
 	EnvPropagationTimeout = envNamespace + "PROPAGATION_TIMEOUT"
 	EnvPollingInterval    = envNamespace + "POLLING_INTERVAL"
 	EnvHTTPTimeout        = envNamespace + "HTTP_TIMEOUT"
 )
+
+var _ challenge.ProviderTimeout = (*DNSProvider)(nil)
 
 // Config is used to configure the creation of the DNSProvider.
 type Config struct {
@@ -48,6 +47,8 @@ type Config struct {
 	PollingInterval    time.Duration
 	TTL                int
 	HTTPClient         *http.Client
+	Debug              bool
+	SkipDeploy         bool
 }
 
 // NewDefaultConfig returns a default configuration for the DNSProvider.
@@ -59,20 +60,25 @@ func NewDefaultConfig() *Config {
 		HTTPClient: &http.Client{
 			Timeout: env.GetOrDefaultSecond(EnvHTTPTimeout, 30*time.Second),
 		},
+		Debug:      env.GetOrDefaultBool(EnvDebug, false),
+		SkipDeploy: env.GetOrDefaultBool(EnvSkipDeploy, false),
 	}
 }
 
 // DNSProvider implements the challenge.Provider interface.
 type DNSProvider struct {
 	config *Config
-	token  string
+	client *internal.Client
 }
 
 // NewDNSProvider returns a DNSProvider instance configured for Bluecat DNS.
-// Credentials must be passed in the environment variables: BLUECAT_SERVER_URL, BLUECAT_USER_NAME and BLUECAT_PASSWORD.
-// BLUECAT_SERVER_URL should have the scheme, hostname, and port (if required) of the authoritative Bluecat BAM server.
-// The REST endpoint will be appended.
-// In addition, the Configuration name and external DNS View Name must be passed in BLUECAT_CONFIG_NAME and BLUECAT_DNS_VIEW.
+// Credentials must be passed in the environment variables:
+//   - BLUECAT_SERVER_URL
+//     It should have the scheme, hostname, and port (if required) of the authoritative Bluecat BAM server.
+//     The REST endpoint will be appended.
+//   - BLUECAT_USER_NAME and BLUECAT_PASSWORD
+//   - BLUECAT_CONFIG_NAME (the Configuration name)
+//   - BLUECAT_DNS_VIEW (external DNS View Name)
 func NewDNSProvider() (*DNSProvider, error) {
 	values, err := env.Get(EnvServerURL, EnvUserName, EnvPassword, EnvConfigName, EnvDNSView)
 	if err != nil {
@@ -99,114 +105,110 @@ func NewDNSProviderConfig(config *Config) (*DNSProvider, error) {
 		return nil, errors.New("bluecat: credentials missing")
 	}
 
-	return &DNSProvider{config: config}, nil
+	client := internal.NewClient(config.BaseURL, config.UserName, config.Password)
+
+	if config.HTTPClient != nil {
+		client.HTTPClient = config.HTTPClient
+	}
+
+	client.HTTPClient = clientdebug.Wrap(client.HTTPClient)
+
+	return &DNSProvider{config: config, client: client}, nil
 }
 
 // Present creates a TXT record using the specified parameters
-// This will *not* create a subzone to contain the TXT record,
-// so make sure the FQDN specified is within an extant zone.
+// This will *not* create a sub-zone to contain the TXT record,
+// so make sure the FQDN specified is within an existent zone.
 func (d *DNSProvider) Present(domain, token, keyAuth string) error {
-	fqdn, value := dns01.GetRecord(domain, keyAuth)
+	info := dns01.GetChallengeInfo(domain, keyAuth)
 
-	err := d.login()
+	ctx, err := d.client.CreateAuthenticatedContext(context.Background())
 	if err != nil {
-		return err
+		return fmt.Errorf("bluecat: login: %w", err)
 	}
 
-	viewID, err := d.lookupViewID(d.config.DNSView)
+	viewID, err := d.client.LookupViewID(ctx, d.config.ConfigName, d.config.DNSView)
 	if err != nil {
-		return err
+		return fmt.Errorf("bluecat: lookupViewID: %w", err)
 	}
 
-	parentZoneID, name, err := d.lookupParentZoneID(viewID, fqdn)
+	parentZoneID, name, err := d.client.LookupParentZoneID(ctx, viewID, info.EffectiveFQDN)
 	if err != nil {
-		return err
+		return fmt.Errorf("bluecat: lookupParentZoneID: %w", err)
 	}
 
-	queryArgs := map[string]string{
-		"parentId": strconv.FormatUint(uint64(parentZoneID), 10),
+	if d.config.Debug {
+		log.Infof("fqdn: %s; viewID: %d; ZoneID: %d; zone: %s", info.EffectiveFQDN, viewID, parentZoneID, name)
 	}
 
-	body := bluecatEntity{
+	txtRecord := internal.Entity{
 		Name:       name,
-		Type:       "TXTRecord",
-		Properties: fmt.Sprintf("ttl=%d|absoluteName=%s|txt=%s|", d.config.TTL, fqdn, value),
+		Type:       internal.TXTType,
+		Properties: fmt.Sprintf("ttl=%d|absoluteName=%s|txt=%s|", d.config.TTL, info.EffectiveFQDN, info.Value),
 	}
 
-	resp, err := d.sendRequest(http.MethodPost, "addEntity", body, queryArgs)
+	_, err = d.client.AddEntity(ctx, parentZoneID, txtRecord)
 	if err != nil {
-		return err
+		return fmt.Errorf("bluecat: add TXT record: %w", err)
 	}
-	defer resp.Body.Close()
 
-	addTxtBytes, _ := ioutil.ReadAll(resp.Body)
-	addTxtResp := string(addTxtBytes)
-	// addEntity responds only with body text containing the ID of the created record
-	_, err = strconv.ParseUint(addTxtResp, 10, 64)
+	if !d.config.SkipDeploy {
+		err = d.client.Deploy(ctx, parentZoneID)
+		if err != nil {
+			return fmt.Errorf("bluecat: deploy: %w", err)
+		}
+	}
+
+	err = d.client.Logout(ctx)
 	if err != nil {
-		return fmt.Errorf("bluecat: addEntity request failed: %s", addTxtResp)
+		return fmt.Errorf("bluecat: logout: %w", err)
 	}
 
-	err = d.deploy(parentZoneID)
-	if err != nil {
-		return err
-	}
-
-	return d.logout()
+	return nil
 }
 
 // CleanUp removes the TXT record matching the specified parameters.
 func (d *DNSProvider) CleanUp(domain, token, keyAuth string) error {
-	fqdn, _ := dns01.GetRecord(domain, keyAuth)
+	info := dns01.GetChallengeInfo(domain, keyAuth)
 
-	err := d.login()
+	ctx, err := d.client.CreateAuthenticatedContext(context.Background())
 	if err != nil {
-		return err
+		return fmt.Errorf("bluecat: login: %w", err)
 	}
 
-	viewID, err := d.lookupViewID(d.config.DNSView)
+	viewID, err := d.client.LookupViewID(ctx, d.config.ConfigName, d.config.DNSView)
 	if err != nil {
-		return err
+		return fmt.Errorf("bluecat: lookupViewID: %w", err)
 	}
 
-	parentID, name, err := d.lookupParentZoneID(viewID, fqdn)
+	parentZoneID, name, err := d.client.LookupParentZoneID(ctx, viewID, info.EffectiveFQDN)
 	if err != nil {
-		return err
+		return fmt.Errorf("bluecat: lookupParentZoneID: %w", err)
 	}
 
-	queryArgs := map[string]string{
-		"parentId": strconv.FormatUint(uint64(parentID), 10),
-		"name":     name,
-		"type":     txtType,
-	}
-
-	resp, err := d.sendRequest(http.MethodGet, "getEntityByName", nil, queryArgs)
+	txtRecord, err := d.client.GetEntityByName(ctx, parentZoneID, name, internal.TXTType)
 	if err != nil {
-		return err
+		return fmt.Errorf("bluecat: get TXT record: %w", err)
 	}
-	defer resp.Body.Close()
 
-	var txtRec entityResponse
-	err = json.NewDecoder(resp.Body).Decode(&txtRec)
+	err = d.client.Delete(ctx, txtRecord.ID)
 	if err != nil {
-		return fmt.Errorf("bluecat: %w", err)
-	}
-	queryArgs = map[string]string{
-		"objectId": strconv.FormatUint(uint64(txtRec.ID), 10),
+		return fmt.Errorf("bluecat: delete TXT record: %w", err)
 	}
 
-	resp, err = d.sendRequest(http.MethodDelete, http.MethodDelete, nil, queryArgs)
+	if !d.config.SkipDeploy {
+		err = d.client.Deploy(ctx, parentZoneID)
+		if err != nil {
+			return fmt.Errorf("bluecat: deploy: %w", err)
+		}
+	}
+
+	err = d.client.Logout(ctx)
 	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	err = d.deploy(parentID)
-	if err != nil {
-		return err
+		return fmt.Errorf("bluecat: logout: %w", err)
 	}
 
-	return d.logout()
+	return nil
 }
 
 // Timeout returns the timeout and interval to use when checking for DNS propagation.

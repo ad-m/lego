@@ -1,24 +1,38 @@
 package cmd
 
 import (
+	"context"
 	"crypto/x509"
+	"encoding/json"
 	"encoding/pem"
 	"fmt"
-	"io/ioutil"
+	"io"
+	"net/http"
 	"os"
 	"strings"
 	"time"
 
+	"github.com/go-acme/lego/v4/acme"
 	"github.com/go-acme/lego/v4/certcrypto"
 	"github.com/go-acme/lego/v4/lego"
 	"github.com/go-acme/lego/v4/log"
 	"github.com/go-acme/lego/v4/registration"
-	"github.com/urfave/cli"
+	"github.com/hashicorp/go-retryablehttp"
+	"github.com/urfave/cli/v2"
 )
 
 const filePerm os.FileMode = 0o600
 
-func setup(ctx *cli.Context, accountsStorage *AccountsStorage) (*Account, *lego.Client) {
+// setupClient creates a new client with challenge settings.
+func setupClient(ctx *cli.Context, account *Account, keyType certcrypto.KeyType) *lego.Client {
+	client := newClient(ctx, account, keyType)
+
+	setupChallenges(ctx, client)
+
+	return client
+}
+
+func setupAccount(ctx *cli.Context, accountsStorage *AccountsStorage) (*Account, certcrypto.KeyType) {
 	keyType := getKeyType(ctx)
 	privateKey := accountsStorage.GetPrivateKey(keyType)
 
@@ -26,35 +40,56 @@ func setup(ctx *cli.Context, accountsStorage *AccountsStorage) (*Account, *lego.
 	if accountsStorage.ExistsAccountFilePath() {
 		account = accountsStorage.LoadAccount(privateKey)
 	} else {
-		account = &Account{Email: accountsStorage.GetUserID(), key: privateKey}
+		account = &Account{Email: accountsStorage.GetEmail(), key: privateKey}
 	}
 
-	client := newClient(ctx, account, keyType)
-
-	return account, client
+	return account, keyType
 }
 
 func newClient(ctx *cli.Context, acc registration.User, keyType certcrypto.KeyType) *lego.Client {
 	config := lego.NewConfig(acc)
-	config.CADirURL = ctx.GlobalString("server")
+	config.CADirURL = ctx.String(flgServer)
 
 	config.Certificate = lego.CertificateConfig{
-		KeyType: keyType,
-		Timeout: time.Duration(ctx.GlobalInt("cert.timeout")) * time.Second,
+		KeyType:             keyType,
+		Timeout:             time.Duration(ctx.Int(flgCertTimeout)) * time.Second,
+		OverallRequestLimit: ctx.Int(flgOverallRequestLimit),
+		DisableCommonName:   ctx.Bool(flgDisableCommonName),
 	}
-	config.UserAgent = fmt.Sprintf("lego-cli/%s", ctx.App.Version)
+	config.UserAgent = getUserAgent(ctx)
 
-	if ctx.GlobalIsSet("http-timeout") {
-		config.HTTPClient.Timeout = time.Duration(ctx.GlobalInt("http-timeout")) * time.Second
+	if ctx.IsSet(flgHTTPTimeout) {
+		config.HTTPClient.Timeout = time.Duration(ctx.Int(flgHTTPTimeout)) * time.Second
 	}
+
+	if ctx.Bool(flgTLSSkipVerify) {
+		defaultTransport, ok := config.HTTPClient.Transport.(*http.Transport)
+		if ok { // This is always true because the default client used by the CLI defined the transport.
+			tr := defaultTransport.Clone()
+			tr.TLSClientConfig.InsecureSkipVerify = true
+			config.HTTPClient.Transport = tr
+		}
+	}
+
+	retryClient := retryablehttp.NewClient()
+	retryClient.RetryMax = 5
+	retryClient.HTTPClient = config.HTTPClient
+	retryClient.CheckRetry = checkRetry
+	retryClient.Logger = nil
+
+	if _, v := os.LookupEnv("LEGO_DEBUG_ACME_HTTP_CLIENT"); v {
+		retryClient.Logger = log.Logger
+	}
+
+	config.HTTPClient = retryClient.StandardClient()
 
 	client, err := lego.NewClient(config)
 	if err != nil {
 		log.Fatalf("Could not create client: %v", err)
 	}
 
-	if client.GetExternalAccountRequired() && !ctx.GlobalIsSet("eab") {
-		log.Fatal("Server requires External Account Binding. Use --eab with --kid and --hmac.")
+	if client.GetExternalAccountRequired() && !ctx.IsSet(flgEAB) {
+		log.Fatalf("Server requires External Account Binding. Use --%s with --%s and --%s.", flgEAB, flgKID, flgHMAC)
 	}
 
 	return client
@@ -62,10 +97,12 @@ func newClient(ctx *cli.Context, acc registration.User, keyType certcrypto.KeyTy
 
 // getKeyType the type from which private keys should be generated.
 func getKeyType(ctx *cli.Context) certcrypto.KeyType {
-	keyType := ctx.GlobalString("key-type")
+	keyType := ctx.String(flgKeyType)
 	switch strings.ToUpper(keyType) {
 	case "RSA2048":
 		return certcrypto.RSA2048
+	case "RSA3072":
+		return certcrypto.RSA3072
 	case "RSA4096":
 		return certcrypto.RSA4096
 	case "RSA8192":
@@ -77,15 +114,12 @@ func getKeyType(ctx *cli.Context) certcrypto.KeyType {
 	}
 
 	log.Fatalf("Unsupported KeyType: %s", keyType)
+
 	return ""
 }
 
-func getEmail(ctx *cli.Context) string {
-	email := ctx.GlobalString("email")
-	if email == "" {
-		log.Fatal("You have to pass an account (email address) to the program using --email or -m")
-	}
-	return email
+func getUserAgent(ctx *cli.Context) string {
+	return strings.TrimSpace(fmt.Sprintf("%s lego-cli/%s", ctx.String(flgUserAgent), ctx.App.Version))
 }
 
 func createNonExistingFolder(path string) error {
@@ -94,18 +128,21 @@ func createNonExistingFolder(path string) error {
 	} else if err != nil {
 		return err
 	}
+
 	return nil
 }
 
 func readCSRFile(filename string) (*x509.CertificateRequest, error) {
-	bytes, err := ioutil.ReadFile(filename)
+	bytes, err := os.ReadFile(filename)
 	if err != nil {
 		return nil, err
 	}
+
 	raw := bytes
 
 	// see if we can find a PEM-encoded CSR
 	var p *pem.Block
+
 	rest := bytes
 	for {
 		// decode a PEM block
@@ -117,7 +154,7 @@ func readCSRFile(filename string) (*x509.CertificateRequest, error) {
 		}
 
 		// did we get a CSR?
-		if p.Type == "CERTIFICATE REQUEST" {
+		if p.Type == "CERTIFICATE REQUEST" || p.Type == "NEW CERTIFICATE REQUEST" {
 			raw = p.Bytes
 		}
 	}
@@ -126,4 +163,50 @@ func readCSRFile(filename string) (*x509.CertificateRequest, error) {
 	// assume we were given a DER-encoded ASN.1 CSR
 	// (if this assumption is wrong, parsing these bytes will fail)
 	return x509.ParseCertificateRequest(raw)
+}
+
+func checkRetry(ctx context.Context, resp *http.Response, err error) (bool, error) {
+	rt, err := retryablehttp.ErrorPropagatedRetryPolicy(ctx, resp, err)
+	if err != nil {
+		return rt, err
+	}
+
+	if resp == nil {
+		return rt, nil
+	}
+
+	if resp.StatusCode/100 == 2 {
+		return rt, nil
+	}
+
+	all, err := io.ReadAll(resp.Body)
+	if err == nil {
+		var errorDetails *acme.ProblemDetails
+
+		err = json.Unmarshal(all, &errorDetails)
+		if err != nil {
+			return rt, fmt.Errorf("%s %s: %s", resp.Request.Method, resp.Request.URL.Redacted(), string(all))
+		}
+
+		switch errorDetails.Type {
+		case acme.BadNonceErr:
+			return false, &acme.NonceError{
+				ProblemDetails: errorDetails,
+			}
+
+		case acme.AlreadyReplacedErr:
+			if errorDetails.HTTPStatus == http.StatusConflict {
+				return false, &acme.AlreadyReplacedError{
+					ProblemDetails: errorDetails,
+				}
+			}
+
+		default:
+			log.Warnf("retry: %v", errorDetails)
+
+			return rt, errorDetails
+		}
+	}
+
+	return rt, nil
 }

@@ -1,11 +1,13 @@
 package edgedns
 
 import (
+	"context"
 	"fmt"
 	"testing"
 	"time"
 
-	configdns "github.com/akamai/AkamaiOPEN-edgegrid-golang/configdns-v2"
+	edgegriddns "github.com/akamai/AkamaiOPEN-edgegrid-golang/v13/pkg/dns"
+	"github.com/akamai/AkamaiOPEN-edgegrid-golang/v13/pkg/session"
 	"github.com/go-acme/lego/v4/challenge/dns01"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -17,6 +19,7 @@ func TestLivePresent(t *testing.T) {
 	}
 
 	envTest.RestoreEnv()
+
 	provider, err := NewDNSProvider()
 	require.NoError(t, err)
 
@@ -34,6 +37,7 @@ func TestLiveCleanUp(t *testing.T) {
 	}
 
 	envTest.RestoreEnv()
+
 	provider, err := NewDNSProvider()
 	require.NoError(t, err)
 
@@ -66,21 +70,32 @@ func TestLiveTTL(t *testing.T) {
 	}()
 
 	fqdn := "_acme-challenge." + domain + "."
-	zone, err := findZone(domain)
+	zone, err := getZone(fqdn)
 	require.NoError(t, err)
 
-	resourceRecordSets, err := configdns.GetRecordList(zone, fqdn, "TXT")
+	ctx := context.Background()
+
+	sess, err := session.New(session.WithSigner(provider.config))
 	require.NoError(t, err)
 
-	for i, rrset := range resourceRecordSets.Recordsets {
+	client := edgegriddns.Client(sess)
+
+	resourceRecordSets, err := client.GetRecordList(ctx, edgegriddns.GetRecordListRequest{
+		Zone:       zone,
+		RecordType: "TXT",
+	})
+
+	require.NoError(t, err)
+
+	for i, rrset := range resourceRecordSets.RecordSets {
 		if rrset.Name != fqdn {
 			continue
 		}
 
 		t.Run(fmt.Sprintf("testing record set %d", i), func(t *testing.T) {
-			assert.Equal(t, rrset.Name, fqdn)
-			assert.Equal(t, rrset.Type, "TXT")
-			assert.Equal(t, rrset.TTL, dns01.DefaultTTL)
+			assert.Equal(t, fqdn, rrset.Name)
+			assert.Equal(t, "TXT", rrset.Type)
+			assert.Equal(t, dns01.DefaultTTL, rrset.TTL)
 		})
 	}
 }

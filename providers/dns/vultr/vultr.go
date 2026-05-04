@@ -10,9 +10,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/go-acme/lego/v4/challenge"
 	"github.com/go-acme/lego/v4/challenge/dns01"
 	"github.com/go-acme/lego/v4/platform/config/env"
-	"github.com/vultr/govultr/v2"
+	"github.com/go-acme/lego/v4/providers/dns/internal/clientdebug"
+	"github.com/vultr/govultr/v3"
 	"golang.org/x/oauth2"
 )
 
@@ -28,6 +30,8 @@ const (
 	EnvHTTPTimeout        = envNamespace + "HTTP_TIMEOUT"
 )
 
+var _ challenge.ProviderTimeout = (*DNSProvider)(nil)
+
 // Config is used to configure the creation of the DNSProvider.
 type Config struct {
 	APIKey             string
@@ -35,7 +39,7 @@ type Config struct {
 	PollingInterval    time.Duration
 	TTL                int
 	HTTPClient         *http.Client
-	HTTPTimeout        time.Duration
+	HTTPTimeout        time.Duration // TODO(ldez): remove in v5
 }
 
 // NewDefaultConfig returns a default configuration for the DNSProvider.
@@ -78,17 +82,10 @@ func NewDNSProviderConfig(config *Config) (*DNSProvider, error) {
 		return nil, errors.New("vultr: credentials missing")
 	}
 
-	httpClient := config.HTTPClient
-	if httpClient == nil {
-		httpClient = &http.Client{
-			Timeout: config.HTTPTimeout,
-			Transport: &oauth2.Transport{
-				Source: oauth2.StaticTokenSource(&oauth2.Token{AccessToken: config.APIKey}),
-			},
-		}
-	}
+	authClient := OAuthStaticAccessToken(config.HTTPClient, config.APIKey)
+	authClient.Timeout = config.HTTPTimeout
 
-	client := govultr.NewClient(httpClient)
+	client := govultr.NewClient(clientdebug.Wrap(authClient))
 
 	return &DNSProvider{client: client, config: config}, nil
 }
@@ -97,25 +94,30 @@ func NewDNSProviderConfig(config *Config) (*DNSProvider, error) {
 func (d *DNSProvider) Present(domain, token, keyAuth string) error {
 	ctx := context.Background()
 
-	fqdn, value := dns01.GetRecord(domain, keyAuth)
+	info := dns01.GetChallengeInfo(domain, keyAuth)
 
+	// TODO(ldez) replace domain by FQDN to follow CNAME.
 	zoneDomain, err := d.getHostedZone(ctx, domain)
 	if err != nil {
 		return fmt.Errorf("vultr: %w", err)
 	}
 
-	name := extractRecordName(fqdn, zoneDomain)
+	subDomain, err := dns01.ExtractSubDomain(info.EffectiveFQDN, zoneDomain)
+	if err != nil {
+		return fmt.Errorf("vultr: %w", err)
+	}
 
-	req := govultr.DomainRecordReq{
-		Name:     name,
+	req := govultr.DomainRecordCreateReq{
+		Name:     subDomain,
 		Type:     "TXT",
-		Data:     `"` + value + `"`,
+		Data:     `"` + info.Value + `"`,
 		TTL:      d.config.TTL,
 		Priority: func(v int) *int { return &v }(0),
 	}
-	_, err = d.client.DomainRecord.Create(ctx, zoneDomain, &req)
+
+	_, resp, err := d.client.DomainRecord.Create(ctx, zoneDomain, &req)
 	if err != nil {
-		return fmt.Errorf("vultr: API call failed: %w", err)
+		return fmt.Errorf("vultr: %w", extendError(resp, err))
 	}
 
 	return nil
@@ -125,14 +127,16 @@ func (d *DNSProvider) Present(domain, token, keyAuth string) error {
 func (d *DNSProvider) CleanUp(domain, token, keyAuth string) error {
 	ctx := context.Background()
 
-	fqdn, _ := dns01.GetRecord(domain, keyAuth)
+	info := dns01.GetChallengeInfo(domain, keyAuth)
 
-	zoneDomain, records, err := d.findTxtRecords(ctx, domain, fqdn)
+	// TODO(ldez) replace domain by FQDN to follow CNAME.
+	zoneDomain, records, err := d.findTxtRecords(ctx, domain, info.EffectiveFQDN)
 	if err != nil {
 		return fmt.Errorf("vultr: %w", err)
 	}
 
 	var allErr []string
+
 	for _, rec := range records {
 		err := d.client.DomainRecord.Delete(ctx, zoneDomain, rec.ID)
 		if err != nil {
@@ -159,9 +163,9 @@ func (d *DNSProvider) getHostedZone(ctx context.Context, domain string) (string,
 	var hostedDomain govultr.Domain
 
 	for {
-		domains, meta, err := d.client.Domain.List(ctx, listOptions)
+		domains, meta, resp, err := d.client.Domain.List(ctx, listOptions)
 		if err != nil {
-			return "", fmt.Errorf("API call failed: %w", err)
+			return "", extendError(resp, err)
 		}
 
 		for _, dom := range domains {
@@ -194,18 +198,23 @@ func (d *DNSProvider) findTxtRecords(ctx context.Context, domain, fqdn string) (
 		return "", nil, err
 	}
 
+	subDomain, err := dns01.ExtractSubDomain(fqdn, zoneDomain)
+	if err != nil {
+		return "", nil, err
+	}
+
 	listOptions := &govultr.ListOptions{PerPage: 25}
 
 	var records []govultr.DomainRecord
+
 	for {
-		result, meta, err := d.client.DomainRecord.List(ctx, zoneDomain, listOptions)
+		result, meta, resp, err := d.client.DomainRecord.List(ctx, zoneDomain, listOptions)
 		if err != nil {
-			return "", records, fmt.Errorf("API call has failed: %w", err)
+			return "", records, extendError(resp, err)
 		}
 
-		recordName := extractRecordName(fqdn, zoneDomain)
 		for _, record := range result {
-			if record.Type == "TXT" && record.Name == recordName {
+			if record.Type == "TXT" && record.Name == subDomain {
 				records = append(records, record)
 			}
 		}
@@ -220,10 +229,24 @@ func (d *DNSProvider) findTxtRecords(ctx context.Context, domain, fqdn string) (
 	return zoneDomain, records, nil
 }
 
-func extractRecordName(fqdn, zone string) string {
-	name := dns01.UnFqdn(fqdn)
-	if idx := strings.Index(name, "."+zone); idx != -1 {
-		return name[:idx]
+func OAuthStaticAccessToken(client *http.Client, accessToken string) *http.Client {
+	if client == nil {
+		client = &http.Client{Timeout: 5 * time.Second}
 	}
-	return name
+
+	client.Transport = &oauth2.Transport{
+		Source: oauth2.StaticTokenSource(&oauth2.Token{AccessToken: accessToken}),
+		Base:   client.Transport,
+	}
+
+	return client
+}
+
+func extendError(resp *http.Response, err error) error {
+	msg := "API call failed"
+	if resp != nil {
+		msg += fmt.Sprintf(" (%d)", resp.StatusCode)
+	}
+
+	return fmt.Errorf("%s: %w", msg, err)
 }

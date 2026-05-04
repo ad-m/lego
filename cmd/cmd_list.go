@@ -3,35 +3,49 @@ package cmd
 import (
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"net"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strings"
 
 	"github.com/go-acme/lego/v4/certcrypto"
-	"github.com/urfave/cli"
+	"github.com/urfave/cli/v2"
 )
 
-func createList() cli.Command {
-	return cli.Command{
+const (
+	flgAccounts = "accounts"
+	flgNames    = "names"
+)
+
+func createList() *cli.Command {
+	return &cli.Command{
 		Name:   "list",
 		Usage:  "Display certificates and accounts information.",
 		Action: list,
 		Flags: []cli.Flag{
-			cli.BoolFlag{
-				Name:  "accounts, a",
-				Usage: "Display accounts.",
+			&cli.BoolFlag{
+				Name:    flgAccounts,
+				Aliases: []string{"a"},
+				Usage:   "Display accounts.",
 			},
-			cli.BoolFlag{
-				Name:  "names, n",
-				Usage: "Display certificate common names only.",
+			&cli.BoolFlag{
+				Name:    flgNames,
+				Aliases: []string{"n"},
+				Usage:   "Display certificate common names only.",
+			},
+			// fake email, needed by NewAccountsStorage
+			&cli.StringFlag{
+				Name:   flgEmail,
+				Value:  "",
+				Hidden: true,
 			},
 		},
 	}
 }
 
 func list(ctx *cli.Context) error {
-	if ctx.Bool("accounts") && !ctx.Bool("names") {
+	if ctx.Bool(flgAccounts) && !ctx.Bool(flgNames) {
 		if err := listAccount(ctx); err != nil {
 			return err
 		}
@@ -48,12 +62,13 @@ func listCertificates(ctx *cli.Context) error {
 		return err
 	}
 
-	names := ctx.Bool("names")
+	names := ctx.Bool(flgNames)
 
 	if len(matches) == 0 {
 		if !names {
 			fmt.Println("No certificates found.")
 		}
+
 		return nil
 	}
 
@@ -62,11 +77,11 @@ func listCertificates(ctx *cli.Context) error {
 	}
 
 	for _, filename := range matches {
-		if strings.HasSuffix(filename, ".issuer.crt") {
+		if strings.HasSuffix(filename, issuerExt) {
 			continue
 		}
 
-		data, err := ioutil.ReadFile(filename)
+		data, err := os.ReadFile(filename)
 		if err != nil {
 			return err
 		}
@@ -76,11 +91,21 @@ func listCertificates(ctx *cli.Context) error {
 			return err
 		}
 
+		name, err := certcrypto.GetCertificateMainDomain(pCert)
+		if err != nil {
+			return err
+		}
+
 		if names {
-			fmt.Println(pCert.Subject.CommonName)
+			fmt.Println(name)
 		} else {
-			fmt.Println("  Certificate Name:", pCert.Subject.CommonName)
+			fmt.Println("  Certificate Name:", name)
 			fmt.Println("    Domains:", strings.Join(pCert.DNSNames, ", "))
+
+			if len(pCert.IPAddresses) > 0 {
+				fmt.Println("    IPs:", formatIPAddresses(pCert.IPAddresses))
+			}
+
 			fmt.Println("    Expiry Date:", pCert.NotAfter)
 			fmt.Println("    Certificate Path:", filename)
 			fmt.Println()
@@ -91,11 +116,6 @@ func listCertificates(ctx *cli.Context) error {
 }
 
 func listAccount(ctx *cli.Context) error {
-	// fake email, needed by NewAccountsStorage
-	if err := ctx.GlobalSet("email", "unknown"); err != nil {
-		return err
-	}
-
 	accountsStorage := NewAccountsStorage(ctx)
 
 	matches, err := filepath.Glob(filepath.Join(accountsStorage.GetRootPath(), "*", "*", "*.json"))
@@ -109,13 +129,15 @@ func listAccount(ctx *cli.Context) error {
 	}
 
 	fmt.Println("Found the following accounts:")
+
 	for _, filename := range matches {
-		data, err := ioutil.ReadFile(filename)
+		data, err := os.ReadFile(filename)
 		if err != nil {
 			return err
 		}
 
 		var account Account
+
 		err = json.Unmarshal(data, &account)
 		if err != nil {
 			return err
@@ -133,4 +155,13 @@ func listAccount(ctx *cli.Context) error {
 	}
 
 	return nil
+}
+
+func formatIPAddresses(ipAddresses []net.IP) string {
+	var ips []string
+	for _, ip := range ipAddresses {
+		ips = append(ips, ip.String())
+	}
+
+	return strings.Join(ips, ", ")
 }

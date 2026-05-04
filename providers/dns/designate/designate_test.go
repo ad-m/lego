@@ -1,7 +1,6 @@
 package designate
 
 import (
-	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -106,6 +105,7 @@ func TestNewDNSProvider_fromEnv(t *testing.T) {
 	for _, test := range testCases {
 		t.Run(test.desc, func(t *testing.T) {
 			defer envTest.RestoreEnv()
+
 			envTest.ClearEnv()
 
 			envTest.Apply(test.envVars)
@@ -193,6 +193,7 @@ func TestNewDNSProvider_fromCloud(t *testing.T) {
 	for _, test := range testCases {
 		t.Run(test.desc, func(t *testing.T) {
 			defer envTest.RestoreEnv()
+
 			envTest.ClearEnv()
 
 			envTest.Apply(map[string]string{
@@ -266,10 +267,10 @@ func TestNewDNSProviderConfig(t *testing.T) {
 func createCloudsYaml(t *testing.T, cloudName string, cloud clientconfig.Cloud) string {
 	t.Helper()
 
-	file, err := ioutil.TempFile("", "lego_test")
+	file, err := os.CreateTemp(t.TempDir(), "lego_test")
 	require.NoError(t, err)
 
-	t.Cleanup(func() { _ = os.RemoveAll(file.Name()) })
+	t.Cleanup(func() { _ = file.Close() })
 
 	clouds := clientconfig.Clouds{
 		Clouds: map[string]clientconfig.Cloud{
@@ -287,6 +288,9 @@ func setupTestProvider(t *testing.T) string {
 	t.Helper()
 
 	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
 	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte(`{
 	"access": {
@@ -317,12 +321,8 @@ func setupTestProvider(t *testing.T) string {
 		]
 	}
 }`))
-		w.WriteHeader(200)
+		w.WriteHeader(http.StatusOK)
 	})
-
-	server := httptest.NewServer(mux)
-
-	t.Cleanup(server.Close)
 
 	return server.URL
 }
@@ -333,6 +333,7 @@ func TestLivePresent(t *testing.T) {
 	}
 
 	envTest.RestoreEnv()
+
 	provider, err := NewDNSProvider()
 	require.NoError(t, err)
 
@@ -346,6 +347,7 @@ func TestLiveCleanUp(t *testing.T) {
 	}
 
 	envTest.RestoreEnv()
+
 	provider, err := NewDNSProvider()
 	require.NoError(t, err)
 

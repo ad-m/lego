@@ -18,43 +18,76 @@ docker run goacme/lego -h
 
 ## From package managers
 
-- [ArchLinux (AUR)](https://aur.archlinux.org/packages/lego):
+- [ArchLinux](https://archlinux.org/packages/extra/x86_64/lego/) (official):
 
-```bash
-yay -S lego
-```
+  ```bash
+  pacman -S lego
+  ```
 
-**Note**: only the package manager for Arch Linux is officially supported by the lego team.
+- [ArchLinux (AUR)](https://aur.archlinux.org/packages/lego-bin) (official):
 
-- [FreeBSD (Ports)](https://www.freshports.org/security/lego):
+  ```bash
+  yay -S lego-bin
+  ```
 
-```bash
-cd /usr/ports/security/lego && make install clean
-```
+- [Snap](https://snapcraft.io/lego) (official):
 
-or
+  ```bash
+  sudo snap install lego
+  ```
+  Note: The snap can only write to the `/var/snap/lego/common/.lego` directory.
 
-```bash
-pkg install lego
-```
+- [FreeBSD (Ports)](https://www.freshports.org/security/lego) (unofficial):
+
+  ```bash
+  pkg install lego
+  ```
+
+- [Gentoo](https://gitweb.gentoo.org/repo/proj/guru.git/tree/app-crypt/lego) (unofficial):
+
+  You can [enable GURU](https://wiki.gentoo.org/wiki/Project:GURU/Information_for_End_Users) repository and then:
+
+  ```bash
+  emerge app-crypt/lego
+  ```
+
+- [Homebrew](https://formulae.brew.sh/formula/lego) (unofficial):
+
+  ```bash
+  brew install lego
+  ```
+
+  or
+
+  ```bash
+  pkg install lego
+  ```
+
+- [OpenBSD (Ports)](https://openports.pl/path/security/lego) (unofficial):
+
+  ```bash
+  pkg_add lego
+  ```
+
 
 ## From sources
 
 Requirements:
 
-- `go` v1.15+
+- go1.22+.
 - environment variable: `GO111MODULE=on`
 
-To install the latest development version from sources, just run:
+To install the latest version from sources, just run:
 
 ```bash
-go get -u github.com/go-acme/lego/v4/cmd/lego
+go install github.com/go-acme/lego/v4/cmd/lego@latest
 ```
 
 or
 
 ```bash
 git clone git@github.com:go-acme/lego.git
+cd lego
 make        # tests + doc + build
 make build  # only build
 ```

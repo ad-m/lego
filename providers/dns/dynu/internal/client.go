@@ -7,44 +7,44 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"net/url"
-	"path"
 	"strconv"
 	"time"
 
-	"github.com/cenkalti/backoff/v4"
+	"github.com/cenkalti/backoff/v5"
 	"github.com/go-acme/lego/v4/log"
+	"github.com/go-acme/lego/v4/platform/wait"
+	"github.com/go-acme/lego/v4/providers/dns/internal/errutils"
 )
 
 const defaultBaseURL = "https://api.dynu.com/v2"
 
 type Client struct {
+	baseURL    *url.URL
 	HTTPClient *http.Client
-	BaseURL    string
 }
 
 func NewClient() *Client {
+	baseURL, _ := url.Parse(defaultBaseURL)
+
 	return &Client{
-		HTTPClient: http.DefaultClient,
-		BaseURL:    defaultBaseURL,
+		HTTPClient: &http.Client{Timeout: 5 * time.Second},
+		baseURL:    baseURL,
 	}
 }
 
 // GetRecords Get DNS records based on a hostname and resource record type.
-func (c Client) GetRecords(hostname, recordType string) ([]DNSRecord, error) {
-	endpoint, err := c.createEndpoint("dns", "record", hostname)
-	if err != nil {
-		return nil, err
-	}
+func (c *Client) GetRecords(ctx context.Context, hostname, recordType string) ([]DNSRecord, error) {
+	endpoint := c.baseURL.JoinPath("dns", "record", hostname)
 
 	query := endpoint.Query()
 	query.Set("recordType", recordType)
 	endpoint.RawQuery = query.Encode()
 
 	apiResp := RecordsResponse{}
-	err = c.doRetry(http.MethodGet, endpoint.String(), nil, &apiResp)
+
+	err := c.doRetry(ctx, http.MethodGet, endpoint.String(), nil, &apiResp)
 	if err != nil {
 		return nil, err
 	}
@@ -57,19 +57,17 @@ func (c Client) GetRecords(hostname, recordType string) ([]DNSRecord, error) {
 }
 
 // AddNewRecord Add a new DNS record for DNS service.
-func (c Client) AddNewRecord(domainID int64, record DNSRecord) error {
-	endpoint, err := c.createEndpoint("dns", strconv.FormatInt(domainID, 10), "record")
-	if err != nil {
-		return err
-	}
+func (c *Client) AddNewRecord(ctx context.Context, domainID int64, record DNSRecord) error {
+	endpoint := c.baseURL.JoinPath("dns", strconv.FormatInt(domainID, 10), "record")
 
 	reqBody, err := json.Marshal(record)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to create request JSON body: %w", err)
 	}
 
 	apiResp := RecordResponse{}
-	err = c.doRetry(http.MethodPost, endpoint.String(), reqBody, &apiResp)
+
+	err = c.doRetry(ctx, http.MethodPost, endpoint.String(), reqBody, &apiResp)
 	if err != nil {
 		return err
 	}
@@ -82,14 +80,12 @@ func (c Client) AddNewRecord(domainID int64, record DNSRecord) error {
 }
 
 // DeleteRecord Remove a DNS record from DNS service.
-func (c Client) DeleteRecord(domainID, recordID int64) error {
-	endpoint, err := c.createEndpoint("dns", strconv.FormatInt(domainID, 10), "record", strconv.FormatInt(recordID, 10))
-	if err != nil {
-		return err
-	}
+func (c *Client) DeleteRecord(ctx context.Context, domainID, recordID int64) error {
+	endpoint := c.baseURL.JoinPath("dns", strconv.FormatInt(domainID, 10), "record", strconv.FormatInt(recordID, 10))
 
 	apiResp := APIException{}
-	err = c.doRetry(http.MethodDelete, endpoint.String(), nil, &apiResp)
+
+	err := c.doRetry(ctx, http.MethodDelete, endpoint.String(), nil, &apiResp)
 	if err != nil {
 		return err
 	}
@@ -102,14 +98,12 @@ func (c Client) DeleteRecord(domainID, recordID int64) error {
 }
 
 // GetRootDomain Get the root domain name based on a hostname.
-func (c Client) GetRootDomain(hostname string) (*DNSHostname, error) {
-	endpoint, err := c.createEndpoint("dns", "getroot", hostname)
-	if err != nil {
-		return nil, err
-	}
+func (c *Client) GetRootDomain(ctx context.Context, hostname string) (*DNSHostname, error) {
+	endpoint := c.baseURL.JoinPath("dns", "getroot", hostname)
 
 	apiResp := DNSHostname{}
-	err = c.doRetry(http.MethodGet, endpoint.String(), nil, &apiResp)
+
+	err := c.doRetry(ctx, http.MethodGet, endpoint.String(), nil, &apiResp)
 	if err != nil {
 		return nil, err
 	}
@@ -121,37 +115,10 @@ func (c Client) GetRootDomain(hostname string) (*DNSHostname, error) {
 	return &apiResp, nil
 }
 
-// doRetry the API is really unstable so we need to retry on EOF.
-func (c Client) doRetry(method, uri string, body []byte, data interface{}) error {
-	var resp *http.Response
-
-	ctx, cancel := context.WithCancel(context.Background())
-
+// doRetry the API is really unstable, so we need to retry on EOF.
+func (c *Client) doRetry(ctx context.Context, method, uri string, body []byte, result any) error {
 	operation := func() error {
-		var reqBody io.Reader
-		if len(body) > 0 {
-			reqBody = bytes.NewReader(body)
-		}
-
-		req, err := http.NewRequest(method, uri, reqBody)
-		if err != nil {
-			return err
-		}
-
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Accept", "application/json")
-
-		resp, err = c.HTTPClient.Do(req)
-		if errors.Is(err, io.EOF) {
-			return err
-		}
-
-		if err != nil {
-			cancel()
-			return fmt.Errorf("client error: %w", err)
-		}
-
-		return nil
+		return c.do(ctx, method, uri, body, result)
 	}
 
 	notify := func(err error, duration time.Duration) {
@@ -161,26 +128,43 @@ func (c Client) doRetry(method, uri string, body []byte, data interface{}) error
 	bo := backoff.NewExponentialBackOff()
 	bo.InitialInterval = 1 * time.Second
 
-	err := backoff.RetryNotify(operation, backoff.WithContext(bo, ctx), notify)
+	return wait.Retry(ctx, operation, backoff.WithBackOff(bo), backoff.WithNotify(notify))
+}
+
+func (c *Client) do(ctx context.Context, method, uri string, body []byte, result any) error {
+	var reqBody io.Reader
+	if len(body) > 0 {
+		reqBody = bytes.NewReader(body)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, method, uri, reqBody)
 	if err != nil {
+		return fmt.Errorf("unable to create request: %w", err)
+	}
+
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.HTTPClient.Do(req)
+	if errors.Is(err, io.EOF) {
 		return err
+	}
+
+	if err != nil {
+		return backoff.Permanent(fmt.Errorf("client error: %w", errutils.NewHTTPDoError(req, err)))
 	}
 
 	defer func() { _ = resp.Body.Close() }()
 
-	all, err := ioutil.ReadAll(resp.Body)
+	raw, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return fmt.Errorf("failed to read response body: %w", err)
+		return backoff.Permanent(errutils.NewReadResponseError(req, resp.StatusCode, err))
 	}
 
-	return json.Unmarshal(all, data)
-}
-
-func (c Client) createEndpoint(fragments ...string) (*url.URL, error) {
-	baseURL, err := url.Parse(c.BaseURL)
+	err = json.Unmarshal(raw, result)
 	if err != nil {
-		return nil, err
+		return backoff.Permanent(errutils.NewUnmarshalError(req, resp.StatusCode, raw, err))
 	}
 
-	return baseURL.Parse(path.Join(baseURL.Path, path.Join(fragments...)))
+	return nil
 }

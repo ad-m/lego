@@ -3,40 +3,42 @@ package cmd
 import (
 	"fmt"
 	"io"
-	"os"
 	"strings"
 	"text/tabwriter"
 
-	"github.com/urfave/cli"
+	"github.com/urfave/cli/v2"
 )
 
-func createDNSHelp() cli.Command {
-	return cli.Command{
+const flgCode = "code"
+
+func createDNSHelp() *cli.Command {
+	return &cli.Command{
 		Name:   "dnshelp",
 		Usage:  "Shows additional help for the '--dns' global option",
 		Action: dnsHelp,
 		Flags: []cli.Flag{
-			cli.StringFlag{
-				Name:  "code, c",
-				Usage: fmt.Sprintf("DNS code: %s", allDNSCodes()),
+			&cli.StringFlag{
+				Name:    flgCode,
+				Aliases: []string{"c"},
+				Usage:   fmt.Sprintf("DNS code: %s", allDNSCodes()),
 			},
 		},
 	}
 }
 
 func dnsHelp(ctx *cli.Context) error {
-	code := ctx.String("code")
+	code := ctx.String(flgCode)
 	if code == "" {
-		w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+		w := tabwriter.NewWriter(ctx.App.Writer, 0, 0, 2, ' ', 0)
 		ew := &errWriter{w: w}
 
 		ew.writeln(`Credentials for DNS providers must be passed through environment variables.`)
 		ew.writeln()
-		ew.writeln(`To display the documentation for a DNS providers:`)
+		ew.writeln(`To display the documentation for a specific DNS provider, run:`)
 		ew.writeln()
 		ew.writeln("\t$ lego dnshelp -c code")
 		ew.writeln()
-		ew.writeln("All DNS codes:")
+		ew.writeln("Supported DNS providers:")
 		ew.writef("\t%s\n", allDNSCodes())
 		ew.writeln()
 		ew.writeln("More information: https://go-acme.github.io/lego/dns")
@@ -48,7 +50,7 @@ func dnsHelp(ctx *cli.Context) error {
 		return w.Flush()
 	}
 
-	return displayDNSHelp(strings.ToLower(code))
+	return displayDNSHelp(ctx.App.Writer, strings.ToLower(code))
 }
 
 type errWriter struct {
@@ -56,7 +58,7 @@ type errWriter struct {
 	err error
 }
 
-func (ew *errWriter) writeln(a ...interface{}) {
+func (ew *errWriter) writeln(a ...any) {
 	if ew.err != nil {
 		return
 	}
@@ -64,7 +66,7 @@ func (ew *errWriter) writeln(a ...interface{}) {
 	_, ew.err = fmt.Fprintln(ew.w, a...)
 }
 
-func (ew *errWriter) writef(format string, a ...interface{}) {
+func (ew *errWriter) writef(format string, a ...any) {
 	if ew.err != nil {
 		return
 	}

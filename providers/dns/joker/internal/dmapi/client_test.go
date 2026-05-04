@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"testing"
 
+	"github.com/go-acme/lego/v4/platform/tester/servermock"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -23,223 +24,20 @@ const (
 	serverErrorUsername = "error"
 )
 
-func setup(t *testing.T) (*http.ServeMux, string) {
-	t.Helper()
+func mockBuilder(auth AuthInfo) *servermock.Builder[*Client] {
+	return servermock.NewBuilder[*Client](
+		func(server *httptest.Server) (*Client, error) {
+			client := NewClient(auth)
+			client.BaseURL = server.URL
+			client.HTTPClient = server.Client()
 
-	mux := http.NewServeMux()
-
-	server := httptest.NewServer(mux)
-	t.Cleanup(server.Close)
-
-	return mux, server.URL
+			return client, nil
+		},
+		servermock.CheckHeader().
+			WithContentTypeFromURLEncoded())
 }
 
-func TestDNSProvider_login_api_key(t *testing.T) {
-	testCases := []struct {
-		desc               string
-		apiKey             string
-		expectedError      bool
-		expectedStatusCode int
-		expectedAuthSid    string
-	}{
-		{
-			desc:               "correct key",
-			apiKey:             correctAPIKey,
-			expectedStatusCode: 0,
-			expectedAuthSid:    correctAPIKey,
-		},
-		{
-			desc:               "incorrect key",
-			apiKey:             incorrectAPIKey,
-			expectedStatusCode: 2200,
-			expectedError:      true,
-		},
-		{
-			desc:               "server error",
-			apiKey:             serverErrorAPIKey,
-			expectedStatusCode: -500,
-			expectedError:      true,
-		},
-		{
-			desc:               "non-ok status code",
-			apiKey:             "333",
-			expectedStatusCode: 2202,
-			expectedError:      true,
-		},
-	}
-
-	mux, serverURL := setup(t)
-
-	mux.HandleFunc("/login", func(w http.ResponseWriter, r *http.Request) {
-		require.Equal(t, http.MethodPost, r.Method)
-
-		switch r.FormValue("api-key") {
-		case correctAPIKey:
-			_, _ = io.WriteString(w, "Status-Code: 0\nStatus-Text: OK\nAuth-Sid: 123\n\ncom\nnet")
-		case incorrectAPIKey:
-			_, _ = io.WriteString(w, "Status-Code: 2200\nStatus-Text: Authentication error")
-		case serverErrorAPIKey:
-			http.NotFound(w, r)
-		default:
-			_, _ = io.WriteString(w, "Status-Code: 2202\nStatus-Text: OK\n\ncom\nnet")
-		}
-	})
-
-	for _, test := range testCases {
-		t.Run(test.desc, func(t *testing.T) {
-			client := NewClient(AuthInfo{APIKey: test.apiKey})
-			client.BaseURL = serverURL
-
-			response, err := client.Login()
-			if test.expectedError {
-				require.Error(t, err)
-			} else {
-				require.NoError(t, err)
-				require.NotNil(t, response)
-				assert.Equal(t, test.expectedStatusCode, response.StatusCode)
-				assert.Equal(t, test.expectedAuthSid, response.AuthSid)
-			}
-		})
-	}
-}
-
-func TestDNSProvider_login_username(t *testing.T) {
-	testCases := []struct {
-		desc               string
-		username           string
-		password           string
-		expectedError      bool
-		expectedStatusCode int
-		expectedAuthSid    string
-	}{
-		{
-			desc:               "correct username and password",
-			username:           correctUsername,
-			password:           "go-acme",
-			expectedError:      false,
-			expectedStatusCode: 0,
-			expectedAuthSid:    correctAPIKey,
-		},
-		{
-			desc:               "incorrect username",
-			username:           incorrectUsername,
-			password:           "go-acme",
-			expectedStatusCode: 2200,
-			expectedError:      true,
-		},
-		{
-			desc:               "server error",
-			username:           serverErrorUsername,
-			password:           "go-acme",
-			expectedStatusCode: -500,
-			expectedError:      true,
-		},
-		{
-			desc:               "non-ok status code",
-			username:           "random",
-			password:           "go-acme",
-			expectedStatusCode: 2202,
-			expectedError:      true,
-		},
-	}
-
-	mux, serverURL := setup(t)
-
-	mux.HandleFunc("/login", func(w http.ResponseWriter, r *http.Request) {
-		require.Equal(t, http.MethodPost, r.Method)
-
-		switch r.FormValue("username") {
-		case correctUsername:
-			_, _ = io.WriteString(w, "Status-Code: 0\nStatus-Text: OK\nAuth-Sid: 123\n\ncom\nnet")
-		case incorrectUsername:
-			_, _ = io.WriteString(w, "Status-Code: 2200\nStatus-Text: Authentication error")
-		case serverErrorUsername:
-			http.NotFound(w, r)
-		default:
-			_, _ = io.WriteString(w, "Status-Code: 2202\nStatus-Text: OK\n\ncom\nnet")
-		}
-	})
-
-	for _, test := range testCases {
-		t.Run(test.desc, func(t *testing.T) {
-			client := NewClient(AuthInfo{Username: test.username, Password: test.password})
-			client.BaseURL = serverURL
-
-			response, err := client.Login()
-			if test.expectedError {
-				require.Error(t, err)
-			} else {
-				require.NoError(t, err)
-				require.NotNil(t, response)
-				assert.Equal(t, test.expectedStatusCode, response.StatusCode)
-				assert.Equal(t, test.expectedAuthSid, response.AuthSid)
-			}
-		})
-	}
-}
-
-func TestDNSProvider_logout(t *testing.T) {
-	testCases := []struct {
-		desc               string
-		authSid            string
-		expectedError      bool
-		expectedStatusCode int
-	}{
-		{
-			desc:               "correct auth-sid",
-			authSid:            correctAPIKey,
-			expectedStatusCode: 0,
-		},
-		{
-			desc:               "incorrect auth-sid",
-			authSid:            incorrectAPIKey,
-			expectedStatusCode: 2200,
-		},
-		{
-			desc:          "already logged out",
-			authSid:       "",
-			expectedError: true,
-		},
-		{
-			desc:          "server error",
-			authSid:       serverErrorAPIKey,
-			expectedError: true,
-		},
-	}
-
-	mux, serverURL := setup(t)
-
-	mux.HandleFunc("/logout", func(w http.ResponseWriter, r *http.Request) {
-		require.Equal(t, http.MethodPost, r.Method)
-
-		switch r.FormValue("auth-sid") {
-		case correctAPIKey:
-			_, _ = io.WriteString(w, "Status-Code: 0\nStatus-Text: OK\n")
-		case incorrectAPIKey:
-			_, _ = io.WriteString(w, "Status-Code: 2200\nStatus-Text: Authentication error")
-		default:
-			http.NotFound(w, r)
-		}
-	})
-
-	for _, test := range testCases {
-		t.Run(test.desc, func(t *testing.T) {
-			client := NewClient(AuthInfo{APIKey: "12345", authSid: test.authSid})
-			client.BaseURL = serverURL
-
-			response, err := client.Logout()
-			if test.expectedError {
-				require.Error(t, err)
-			} else {
-				require.NoError(t, err)
-				require.NotNil(t, response)
-				assert.Equal(t, test.expectedStatusCode, response.StatusCode)
-			}
-		})
-	}
-}
-
-func TestDNSProvider_getZone(t *testing.T) {
+func TestClient_GetZone(t *testing.T) {
 	testZone := "@ A 0 192.0.2.2 3600"
 
 	testCases := []struct {
@@ -276,30 +74,25 @@ func TestDNSProvider_getZone(t *testing.T) {
 		},
 	}
 
-	mux, serverURL := setup(t)
+	client := mockBuilder(AuthInfo{APIKey: "12345"}).
+		Route("POST /dns-zone-get", http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+			authSid := req.FormValue("auth-sid")
+			domain := req.FormValue("domain")
 
-	mux.HandleFunc("/dns-zone-get", func(w http.ResponseWriter, r *http.Request) {
-		require.Equal(t, http.MethodPost, r.Method)
-
-		authSid := r.FormValue("auth-sid")
-		domain := r.FormValue("domain")
-
-		switch {
-		case authSid == correctAPIKey && domain == "known":
-			_, _ = io.WriteString(w, "Status-Code: 0\nStatus-Text: OK\n\n"+testZone)
-		case authSid == incorrectAPIKey || (authSid == correctAPIKey && domain == "unknown"):
-			_, _ = io.WriteString(w, "Status-Code: 2202\nStatus-Text: Authorization error")
-		default:
-			http.NotFound(w, r)
-		}
-	})
+			switch {
+			case authSid == correctAPIKey && domain == "known":
+				_, _ = io.WriteString(rw, "Status-Code: 0\nStatus-Text: OK\n\n"+testZone)
+			case authSid == incorrectAPIKey || (authSid == correctAPIKey && domain == "unknown"):
+				_, _ = io.WriteString(rw, "Status-Code: 2202\nStatus-Text: Authorization error")
+			default:
+				http.NotFound(rw, req)
+			}
+		})).
+		Build(t)
 
 	for _, test := range testCases {
 		t.Run(test.desc, func(t *testing.T) {
-			client := NewClient(AuthInfo{APIKey: "12345", authSid: test.authSid})
-			client.BaseURL = serverURL
-
-			response, err := client.GetZone(test.domain)
+			response, err := client.GetZone(mockContext(t, test.authSid), test.domain)
 			if test.expectedError {
 				require.Error(t, err)
 			} else {
@@ -376,7 +169,6 @@ func Test_parseResponse(t *testing.T) {
 	}
 
 	for _, test := range testCases {
-		test := test
 		t.Run(test.desc, func(t *testing.T) {
 			t.Parallel()
 
@@ -387,7 +179,7 @@ func Test_parseResponse(t *testing.T) {
 	}
 }
 
-func Test_removeTxtEntryFromZone(t *testing.T) {
+func Test_RemoveTxtEntryFromZone(t *testing.T) {
 	testCases := []struct {
 		desc     string
 		input    string
@@ -427,18 +219,17 @@ func Test_removeTxtEntryFromZone(t *testing.T) {
 	}
 
 	for _, test := range testCases {
-		test := test
 		t.Run(test.desc, func(t *testing.T) {
 			t.Parallel()
 
 			zone, modified := RemoveTxtEntryFromZone(test.input, "_acme-challenge")
-			assert.Equal(t, zone, test.expected)
-			assert.Equal(t, modified, test.modified)
+			assert.Equal(t, test.expected, zone)
+			assert.Equal(t, test.modified, modified)
 		})
 	}
 }
 
-func Test_addTxtEntryToZone(t *testing.T) {
+func Test_AddTxtEntryToZone(t *testing.T) {
 	testCases := []struct {
 		desc     string
 		input    string
@@ -464,7 +255,7 @@ func Test_addTxtEntryToZone(t *testing.T) {
 	for _, test := range testCases {
 		t.Run(test.desc, func(t *testing.T) {
 			zone := AddTxtEntryToZone(test.input, "_acme-challenge", "test", 120)
-			assert.Equal(t, zone, test.expected)
+			assert.Equal(t, test.expected, zone)
 		})
 	}
 }
@@ -505,7 +296,7 @@ func Test_fixTxtLines(t *testing.T) {
 	for _, test := range testCases {
 		t.Run(test.desc, func(t *testing.T) {
 			line := fixTxtLines(test.input)
-			assert.Equal(t, line, test.expected)
+			assert.Equal(t, test.expected, line)
 		})
 	}
 }

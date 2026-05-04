@@ -1,20 +1,29 @@
 package cloudflare
 
 import (
+	"net/http/httptest"
 	"testing"
 	"time"
 
 	"github.com/go-acme/lego/v4/platform/tester"
+	"github.com/go-acme/lego/v4/platform/tester/servermock"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
+const envDomain = envNamespace + "DOMAIN"
+
 var envTest = tester.NewEnvTest(
-	"CLOUDFLARE_EMAIL",
-	"CLOUDFLARE_API_KEY",
-	"CLOUDFLARE_DNS_API_TOKEN",
-	"CLOUDFLARE_ZONE_API_TOKEN").
-	WithDomain("CLOUDFLARE_DOMAIN")
+	EnvEmail,
+	EnvAPIKey,
+	EnvDNSAPIToken,
+	EnvZoneAPIToken,
+	EnvBaseURL,
+	altEnvEmail,
+	altEnvName(EnvAPIKey),
+	altEnvName(EnvDNSAPIToken),
+	altEnvName(EnvZoneAPIToken)).
+	WithDomain(envDomain)
 
 func TestNewDNSProvider(t *testing.T) {
 	testCases := []struct {
@@ -25,45 +34,45 @@ func TestNewDNSProvider(t *testing.T) {
 		{
 			desc: "success email, API key",
 			envVars: map[string]string{
-				"CLOUDFLARE_EMAIL":   "test@example.com",
-				"CLOUDFLARE_API_KEY": "123",
+				EnvEmail:  "test@example.com",
+				EnvAPIKey: "123",
 			},
 		},
 		{
 			desc: "success API token",
 			envVars: map[string]string{
-				"CLOUDFLARE_DNS_API_TOKEN": "012345abcdef",
+				EnvDNSAPIToken: "012345abcdef",
 			},
 		},
 		{
 			desc: "success separate API tokens",
 			envVars: map[string]string{
-				"CLOUDFLARE_DNS_API_TOKEN":  "012345abcdef",
-				"CLOUDFLARE_ZONE_API_TOKEN": "abcdef012345",
+				EnvDNSAPIToken:  "012345abcdef",
+				EnvZoneAPIToken: "abcdef012345",
 			},
 		},
 		{
 			desc: "missing credentials",
 			envVars: map[string]string{
-				"CLOUDFLARE_EMAIL":         "",
-				"CLOUDFLARE_API_KEY":       "",
-				"CLOUDFLARE_DNS_API_TOKEN": "",
+				EnvEmail:       "",
+				EnvAPIKey:      "",
+				EnvDNSAPIToken: "",
 			},
 			expected: "cloudflare: some credentials information are missing: CLOUDFLARE_EMAIL,CLOUDFLARE_API_KEY or some credentials information are missing: CLOUDFLARE_DNS_API_TOKEN,CLOUDFLARE_ZONE_API_TOKEN",
 		},
 		{
 			desc: "missing email",
 			envVars: map[string]string{
-				"CLOUDFLARE_EMAIL":   "",
-				"CLOUDFLARE_API_KEY": "key",
+				EnvEmail:  "",
+				EnvAPIKey: "key",
 			},
 			expected: "cloudflare: some credentials information are missing: CLOUDFLARE_EMAIL or some credentials information are missing: CLOUDFLARE_DNS_API_TOKEN,CLOUDFLARE_ZONE_API_TOKEN",
 		},
 		{
 			desc: "missing api key",
 			envVars: map[string]string{
-				"CLOUDFLARE_EMAIL":   "awesome@possum.com",
-				"CLOUDFLARE_API_KEY": "",
+				EnvEmail:  "awesome@possum.com",
+				EnvAPIKey: "",
 			},
 			expected: "cloudflare: some credentials information are missing: CLOUDFLARE_API_KEY or some credentials information are missing: CLOUDFLARE_DNS_API_TOKEN,CLOUDFLARE_ZONE_API_TOKEN",
 		},
@@ -72,6 +81,7 @@ func TestNewDNSProvider(t *testing.T) {
 	for _, test := range testCases {
 		t.Run(test.desc, func(t *testing.T) {
 			defer envTest.RestoreEnv()
+
 			envTest.ClearEnv()
 
 			envTest.Apply(test.envVars)
@@ -110,7 +120,7 @@ func TestNewDNSProviderWithToken(t *testing.T) {
 		{
 			desc: "same client when zone token is missing",
 			envVars: map[string]string{
-				"CLOUDFLARE_DNS_API_TOKEN": "123",
+				EnvDNSAPIToken: "123",
 			},
 			expected: expected{
 				dnsToken:   "123",
@@ -121,8 +131,8 @@ func TestNewDNSProviderWithToken(t *testing.T) {
 		{
 			desc: "same client when zone token equals dns token",
 			envVars: map[string]string{
-				"CLOUDFLARE_DNS_API_TOKEN":  "123",
-				"CLOUDFLARE_ZONE_API_TOKEN": "123",
+				EnvDNSAPIToken:  "123",
+				EnvZoneAPIToken: "123",
 			},
 			expected: expected{
 				dnsToken:   "123",
@@ -133,7 +143,7 @@ func TestNewDNSProviderWithToken(t *testing.T) {
 		{
 			desc: "failure when only zone api given",
 			envVars: map[string]string{
-				"CLOUDFLARE_ZONE_API_TOKEN": "123",
+				EnvZoneAPIToken: "123",
 			},
 			expected: expected{
 				error: "cloudflare: some credentials information are missing: CLOUDFLARE_EMAIL,CLOUDFLARE_API_KEY or some credentials information are missing: CLOUDFLARE_DNS_API_TOKEN",
@@ -142,8 +152,8 @@ func TestNewDNSProviderWithToken(t *testing.T) {
 		{
 			desc: "different clients when zone and dns token differ",
 			envVars: map[string]string{
-				"CLOUDFLARE_DNS_API_TOKEN":  "123",
-				"CLOUDFLARE_ZONE_API_TOKEN": "abc",
+				EnvDNSAPIToken:  "123",
+				EnvZoneAPIToken: "abc",
 			},
 			expected: expected{
 				dnsToken:   "123",
@@ -154,10 +164,10 @@ func TestNewDNSProviderWithToken(t *testing.T) {
 		{
 			desc: "aliases work as expected", // CLOUDFLARE_* takes precedence over CF_*
 			envVars: map[string]string{
-				"CLOUDFLARE_DNS_API_TOKEN":  "123",
-				"CF_DNS_API_TOKEN":          "456",
-				"CLOUDFLARE_ZONE_API_TOKEN": "abc",
-				"CF_ZONE_API_TOKEN":         "def",
+				EnvDNSAPIToken:              "123",
+				altEnvName(EnvDNSAPIToken):  "456",
+				EnvZoneAPIToken:             "abc",
+				altEnvName(EnvZoneAPIToken): "def",
 			},
 			expected: expected{
 				dnsToken:   "123",
@@ -168,15 +178,18 @@ func TestNewDNSProviderWithToken(t *testing.T) {
 	}
 
 	defer envTest.RestoreEnv()
+
 	localEnvTest := tester.NewEnvTest(
-		"CLOUDFLARE_DNS_API_TOKEN", "CF_DNS_API_TOKEN",
-		"CLOUDFLARE_ZONE_API_TOKEN", "CF_ZONE_API_TOKEN",
-	).WithDomain("CLOUDFLARE_DOMAIN")
+		EnvDNSAPIToken, altEnvName(EnvDNSAPIToken),
+		EnvZoneAPIToken, altEnvName(EnvZoneAPIToken),
+	).WithDomain(envDomain)
+
 	envTest.ClearEnv()
 
 	for _, test := range testCases {
 		t.Run(test.desc, func(t *testing.T) {
 			defer localEnvTest.RestoreEnv()
+
 			localEnvTest.ClearEnv()
 			localEnvTest.Apply(test.envVars)
 
@@ -191,6 +204,7 @@ func TestNewDNSProviderWithToken(t *testing.T) {
 			require.NotNil(t, p)
 			assert.Equal(t, test.expected.dnsToken, p.config.AuthToken)
 			assert.Equal(t, test.expected.zoneToken, p.config.ZoneToken)
+
 			if test.expected.sameClient {
 				assert.Equal(t, p.client.clientRead, p.client.clientEdit)
 			} else {
@@ -225,22 +239,17 @@ func TestNewDNSProviderConfig(t *testing.T) {
 		},
 		{
 			desc:     "missing credentials",
-			expected: "cloudflare: invalid credentials: key & email must not be empty",
+			expected: "cloudflare: invalid credentials: authEmail, authKey or authToken must be set",
 		},
 		{
 			desc:     "missing email",
 			authKey:  "123",
-			expected: "cloudflare: invalid credentials: key & email must not be empty",
+			expected: "cloudflare: invalid credentials: authEmail and authKey must be set together",
 		},
 		{
 			desc:      "missing api key",
 			authEmail: "test@example.com",
-			expected:  "cloudflare: invalid credentials: key & email must not be empty",
-		},
-		{
-			desc:      "missing api token, fallback to api key/email",
-			authToken: "",
-			expected:  "cloudflare: invalid credentials: key & email must not be empty",
+			expected:  "cloudflare: invalid credentials: authEmail and authKey must be set together",
 		},
 	}
 
@@ -271,6 +280,7 @@ func TestLivePresent(t *testing.T) {
 	}
 
 	envTest.RestoreEnv()
+
 	provider, err := NewDNSProvider()
 	require.NoError(t, err)
 
@@ -284,11 +294,73 @@ func TestLiveCleanUp(t *testing.T) {
 	}
 
 	envTest.RestoreEnv()
+
 	provider, err := NewDNSProvider()
 	require.NoError(t, err)
 
 	time.Sleep(2 * time.Second)
 
 	err = provider.CleanUp(envTest.GetDomain(), "", "123d==")
+	require.NoError(t, err)
+}
+
+func mockBuilder() *servermock.Builder[*DNSProvider] {
+	return servermock.NewBuilder(
+		func(server *httptest.Server) (*DNSProvider, error) {
+			config := NewDefaultConfig()
+			config.AuthEmail = "foo@example.com"
+			config.AuthKey = "secret"
+			config.BaseURL = server.URL
+			config.HTTPClient = server.Client()
+
+			return NewDNSProviderConfig(config)
+		},
+		servermock.CheckHeader().
+			WithRegexp("User-Agent", `goacme-lego/[0-9.]+ \(.+\)`).
+			With("X-Auth-Email", "foo@example.com").
+			With("X-Auth-Key", "secret"),
+	)
+}
+
+func TestDNSProvider_Present(t *testing.T) {
+	provider := mockBuilder().
+		// https://developers.cloudflare.com/api/resources/zones/methods/list/
+		Route("GET /zones",
+			servermock.ResponseFromInternal("zones.json"),
+			servermock.CheckQueryParameter().Strict().
+				With("name", "example.com").
+				With("per_page", "50")).
+		// https://developers.cloudflare.com/api/resources/dns/subresources/records/methods/create/
+		Route("POST /zones/023e105f4ecef8ad9ca31a8372d0c353/dns_records",
+			servermock.ResponseFromInternal("create_record.json"),
+			servermock.CheckHeader().
+				WithContentType("application/json"),
+			servermock.CheckRequestJSONBodyFromInternal("create_record-request.json")).
+		Build(t)
+
+	err := provider.Present("example.com", "abc", "123d==")
+	require.NoError(t, err)
+}
+
+func TestDNSProvider_CleanUp(t *testing.T) {
+	provider := mockBuilder().
+		// https://developers.cloudflare.com/api/resources/zones/methods/list/
+		Route("GET /zones",
+			servermock.ResponseFromInternal("zones.json"),
+			servermock.CheckQueryParameter().Strict().
+				With("name", "example.com").
+				With("per_page", "50")).
+		// https://developers.cloudflare.com/api/resources/dns/subresources/records/methods/delete/
+		Route("DELETE /zones/023e105f4ecef8ad9ca31a8372d0c353/dns_records/xxx",
+			servermock.ResponseFromInternal("delete_record.json")).
+		Build(t)
+
+	token := "abc"
+
+	provider.recordIDsMu.Lock()
+	provider.recordIDs["abc"] = "xxx"
+	provider.recordIDsMu.Unlock()
+
+	err := provider.CleanUp("example.com", token, "123d==")
 	require.NoError(t, err)
 }

@@ -2,6 +2,7 @@
 package versio
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
@@ -9,8 +10,11 @@ import (
 	"sync"
 	"time"
 
+	"github.com/go-acme/lego/v4/challenge"
 	"github.com/go-acme/lego/v4/challenge/dns01"
 	"github.com/go-acme/lego/v4/platform/config/env"
+	"github.com/go-acme/lego/v4/providers/dns/internal/clientdebug"
+	"github.com/go-acme/lego/v4/providers/dns/versio/internal"
 )
 
 // Environment variables names.
@@ -28,6 +32,8 @@ const (
 	EnvHTTPTimeout        = envNamespace + "HTTP_TIMEOUT"
 )
 
+var _ challenge.ProviderTimeout = (*DNSProvider)(nil)
+
 // Config is used to configure the creation of the DNSProvider.
 type Config struct {
 	BaseURL            *url.URL
@@ -42,15 +48,15 @@ type Config struct {
 
 // NewDefaultConfig returns a default configuration for the DNSProvider.
 func NewDefaultConfig() *Config {
-	baseURL, err := url.Parse(env.GetOrDefaultString(EnvEndpoint, defaultBaseURL))
+	baseURL, err := url.Parse(env.GetOrDefaultString(EnvEndpoint, internal.DefaultBaseURL))
 	if err != nil {
-		baseURL, _ = url.Parse(defaultBaseURL)
+		baseURL, _ = url.Parse(internal.DefaultBaseURL)
 	}
 
 	return &Config{
 		BaseURL:            baseURL,
 		TTL:                env.GetOrDefaultInt(EnvTTL, 300),
-		PropagationTimeout: env.GetOrDefaultSecond(EnvPropagationTimeout, 60*time.Second),
+		PropagationTimeout: env.GetOrDefaultSecond(EnvPropagationTimeout, dns01.DefaultPropagationTimeout),
 		PollingInterval:    env.GetOrDefaultSecond(EnvPollingInterval, 5*time.Second),
 		SequenceInterval:   env.GetOrDefaultSecond(EnvSequenceInterval, dns01.DefaultPropagationTimeout),
 		HTTPClient: &http.Client{
@@ -61,7 +67,9 @@ func NewDefaultConfig() *Config {
 
 // DNSProvider implements the challenge.Provider interface.
 type DNSProvider struct {
-	config       *Config
+	config *Config
+	client *internal.Client
+
 	dnsEntriesMu sync.Mutex
 }
 
@@ -84,14 +92,28 @@ func NewDNSProviderConfig(config *Config) (*DNSProvider, error) {
 	if config == nil {
 		return nil, errors.New("versio: the configuration of the DNS provider is nil")
 	}
+
 	if config.Username == "" {
 		return nil, errors.New("versio: the versio username is missing")
 	}
+
 	if config.Password == "" {
 		return nil, errors.New("versio: the versio password is missing")
 	}
 
-	return &DNSProvider{config: config}, nil
+	client := internal.NewClient(config.Username, config.Password)
+
+	if config.BaseURL != nil {
+		client.BaseURL = config.BaseURL
+	}
+
+	if config.HTTPClient != nil {
+		client.HTTPClient = config.HTTPClient
+	}
+
+	client.HTTPClient = clientdebug.Wrap(client.HTTPClient)
+
+	return &DNSProvider{config: config, client: client}, nil
 }
 
 // Timeout returns the timeout and interval to use when checking for DNS propagation.
@@ -102,69 +124,81 @@ func (d *DNSProvider) Timeout() (timeout, interval time.Duration) {
 
 // Present creates a TXT record to fulfill the dns-01 challenge.
 func (d *DNSProvider) Present(domain, token, keyAuth string) error {
-	fqdn, value := dns01.GetRecord(domain, keyAuth)
+	info := dns01.GetChallengeInfo(domain, keyAuth)
 
-	authZone, err := dns01.FindZoneByFqdn(fqdn)
+	authZone, err := dns01.FindZoneByFqdn(info.EffectiveFQDN)
 	if err != nil {
-		return fmt.Errorf("versio: %w", err)
+		return fmt.Errorf("versio: could not find zone for domain %q: %w", domain, err)
 	}
 
 	// use mutex to prevent race condition from getDNSRecords until postDNSRecords
 	d.dnsEntriesMu.Lock()
 	defer d.dnsEntriesMu.Unlock()
 
+	ctx := context.Background()
+
 	zoneName := dns01.UnFqdn(authZone)
-	domains, err := d.getDNSRecords(zoneName)
+
+	domains, err := d.client.GetDomain(ctx, zoneName)
 	if err != nil {
 		return fmt.Errorf("versio: %w", err)
 	}
 
-	txtRecord := record{
+	txtRecord := internal.Record{
 		Type:  "TXT",
-		Name:  fqdn,
-		Value: `"` + value + `"`,
+		Name:  info.EffectiveFQDN,
+		Value: `"` + info.Value + `"`,
 		TTL:   d.config.TTL,
 	}
-	// Add new txtRercord to existing array of DNSRecords
-	msg := &domains.Record
+
+	// Add new txtRecord to existing array of DNSRecords.
+	// We'll need all the dns_records to add a new TXT record.
+	msg := &domains.DomainInfo
 	msg.DNSRecords = append(msg.DNSRecords, txtRecord)
 
-	err = d.postDNSRecords(zoneName, msg)
+	_, err = d.client.UpdateDomain(ctx, zoneName, msg)
 	if err != nil {
 		return fmt.Errorf("versio: %w", err)
 	}
+
 	return nil
 }
 
 // CleanUp removes the TXT record matching the specified parameters.
 func (d *DNSProvider) CleanUp(domain, token, keyAuth string) error {
-	fqdn, _ := dns01.GetRecord(domain, keyAuth)
-	authZone, err := dns01.FindZoneByFqdn(fqdn)
+	info := dns01.GetChallengeInfo(domain, keyAuth)
+
+	authZone, err := dns01.FindZoneByFqdn(info.EffectiveFQDN)
 	if err != nil {
-		return fmt.Errorf("versio: %w", err)
+		return fmt.Errorf("versio: could not find zone for domain %q: %w", domain, err)
 	}
 
 	// use mutex to prevent race condition from getDNSRecords until postDNSRecords
 	d.dnsEntriesMu.Lock()
 	defer d.dnsEntriesMu.Unlock()
 
+	ctx := context.Background()
+
 	zoneName := dns01.UnFqdn(authZone)
-	domains, err := d.getDNSRecords(zoneName)
+
+	domains, err := d.client.GetDomain(ctx, zoneName)
 	if err != nil {
 		return fmt.Errorf("versio: %w", err)
 	}
 
 	// loop through the existing entries and remove the specific record
-	msg := &dnsRecord{}
-	for _, e := range domains.Record.DNSRecords {
-		if e.Name != fqdn {
+	msg := &internal.DomainInfo{}
+
+	for _, e := range domains.DomainInfo.DNSRecords {
+		if e.Name != info.EffectiveFQDN {
 			msg.DNSRecords = append(msg.DNSRecords, e)
 		}
 	}
 
-	err = d.postDNSRecords(zoneName, msg)
+	_, err = d.client.UpdateDomain(ctx, zoneName, msg)
 	if err != nil {
 		return fmt.Errorf("versio: %w", err)
 	}
+
 	return nil
 }

@@ -2,17 +2,19 @@
 package servercow
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"time"
 
+	"github.com/go-acme/lego/v4/challenge"
 	"github.com/go-acme/lego/v4/challenge/dns01"
 	"github.com/go-acme/lego/v4/platform/config/env"
+	"github.com/go-acme/lego/v4/providers/dns/internal/clientdebug"
 	"github.com/go-acme/lego/v4/providers/dns/servercow/internal"
 )
-
-const defaultTTL = 120
 
 // Environment variables names.
 const (
@@ -26,6 +28,8 @@ const (
 	EnvPollingInterval    = envNamespace + "POLLING_INTERVAL"
 	EnvHTTPTimeout        = envNamespace + "HTTP_TIMEOUT"
 )
+
+var _ challenge.ProviderTimeout = (*DNSProvider)(nil)
 
 // Config is used to configure the creation of the DNSProvider.
 type Config struct {
@@ -41,7 +45,7 @@ type Config struct {
 // NewDefaultConfig returns a default configuration for the DNSProvider.
 func NewDefaultConfig() *Config {
 	return &Config{
-		TTL:                env.GetOrDefaultInt(EnvTTL, defaultTTL),
+		TTL:                env.GetOrDefaultInt(EnvTTL, dns01.DefaultTTL),
 		PropagationTimeout: env.GetOrDefaultSecond(EnvPropagationTimeout, dns01.DefaultPropagationTimeout),
 		PollingInterval:    env.GetOrDefaultSecond(EnvPollingInterval, dns01.DefaultPollingInterval),
 		HTTPClient: &http.Client{
@@ -76,12 +80,13 @@ func NewDNSProviderConfig(config *Config) (*DNSProvider, error) {
 		return nil, errors.New("servercow: incomplete credentials, missing username and/or password")
 	}
 
+	client := internal.NewClient(config.Username, config.Password)
+
 	if config.HTTPClient == nil {
-		config.HTTPClient = http.DefaultClient
+		client.HTTPClient = config.HTTPClient
 	}
 
-	client := internal.NewClient(config.Username, config.Password)
-	client.HTTPClient = config.HTTPClient
+	client.HTTPClient = clientdebug.Wrap(client.HTTPClient)
 
 	return &DNSProvider{
 		config: config,
@@ -97,25 +102,30 @@ func (d *DNSProvider) Timeout() (timeout, interval time.Duration) {
 
 // Present creates a TXT record to fulfill the dns-01 challenge.
 func (d *DNSProvider) Present(domain, token, keyAuth string) error {
-	fqdn, value := dns01.GetRecord(domain, keyAuth)
+	info := dns01.GetChallengeInfo(domain, keyAuth)
 
-	authZone, err := getAuthZone(domain)
+	authZone, err := getAuthZone(info.EffectiveFQDN)
 	if err != nil {
 		return fmt.Errorf("servercow: %w", err)
 	}
 
-	records, err := d.client.GetRecords(authZone)
+	ctx := context.Background()
+
+	records, err := d.client.GetRecords(ctx, authZone)
 	if err != nil {
 		return fmt.Errorf("servercow: %w", err)
 	}
 
-	recordName := getRecordName(fqdn, authZone)
+	recordName, err := dns01.ExtractSubDomain(info.EffectiveFQDN, authZone)
+	if err != nil {
+		return fmt.Errorf("servercow: %w", err)
+	}
 
 	record := findRecords(records, recordName)
 
 	// TXT record entry already existing
 	if record != nil {
-		if containsValue(record, value) {
+		if slices.Contains(record.Content, info.Value) {
 			return nil
 		}
 
@@ -123,13 +133,14 @@ func (d *DNSProvider) Present(domain, token, keyAuth string) error {
 			Name:    record.Name,
 			TTL:     record.TTL,
 			Type:    record.Type,
-			Content: append(record.Content, value),
+			Content: append(record.Content, info.Value),
 		}
 
-		_, err = d.client.CreateUpdateRecord(authZone, request)
+		_, err = d.client.CreateUpdateRecord(ctx, authZone, request)
 		if err != nil {
 			return fmt.Errorf("servercow: failed to update TXT records: %w", err)
 		}
+
 		return nil
 	}
 
@@ -137,12 +148,12 @@ func (d *DNSProvider) Present(domain, token, keyAuth string) error {
 		Type:    "TXT",
 		Name:    recordName,
 		TTL:     d.config.TTL,
-		Content: internal.Value{value},
+		Content: internal.Value{info.Value},
 	}
 
-	_, err = d.client.CreateUpdateRecord(authZone, request)
+	_, err = d.client.CreateUpdateRecord(ctx, authZone, request)
 	if err != nil {
-		return fmt.Errorf("servercow: failed to create TXT record %s: %w", fqdn, err)
+		return fmt.Errorf("servercow: failed to create TXT record %s: %w", info.EffectiveFQDN, err)
 	}
 
 	return nil
@@ -150,35 +161,41 @@ func (d *DNSProvider) Present(domain, token, keyAuth string) error {
 
 // CleanUp removes the TXT record previously created.
 func (d *DNSProvider) CleanUp(domain, token, keyAuth string) error {
-	fqdn, value := dns01.GetRecord(domain, keyAuth)
+	info := dns01.GetChallengeInfo(domain, keyAuth)
 
-	authZone, err := getAuthZone(domain)
+	authZone, err := getAuthZone(info.EffectiveFQDN)
 	if err != nil {
 		return fmt.Errorf("servercow: %w", err)
 	}
 
-	records, err := d.client.GetRecords(authZone)
+	ctx := context.Background()
+
+	records, err := d.client.GetRecords(ctx, authZone)
 	if err != nil {
 		return fmt.Errorf("servercow: failed to get TXT records: %w", err)
 	}
 
-	recordName := getRecordName(fqdn, authZone)
+	recordName, err := dns01.ExtractSubDomain(info.EffectiveFQDN, authZone)
+	if err != nil {
+		return fmt.Errorf("servercow: %w", err)
+	}
 
 	record := findRecords(records, recordName)
 	if record == nil {
 		return nil
 	}
 
-	if !containsValue(record, value) {
+	if !slices.Contains(record.Content, info.Value) {
 		return nil
 	}
 
 	// only 1 record value, the whole record must be deleted.
 	if len(record.Content) == 1 {
-		_, err = d.client.DeleteRecord(authZone, *record)
+		_, err = d.client.DeleteRecord(ctx, authZone, *record)
 		if err != nil {
 			return fmt.Errorf("servercow: failed to delete TXT records: %w", err)
 		}
+
 		return nil
 	}
 
@@ -189,12 +206,12 @@ func (d *DNSProvider) CleanUp(domain, token, keyAuth string) error {
 	}
 
 	for _, val := range record.Content {
-		if val != value {
+		if val != info.Value {
 			request.Content = append(request.Content, val)
 		}
 	}
 
-	_, err = d.client.CreateUpdateRecord(authZone, request)
+	_, err = d.client.CreateUpdateRecord(ctx, authZone, request)
 	if err != nil {
 		return fmt.Errorf("servercow: failed to update TXT records: %w", err)
 	}
@@ -203,13 +220,12 @@ func (d *DNSProvider) CleanUp(domain, token, keyAuth string) error {
 }
 
 func getAuthZone(domain string) (string, error) {
-	authZone, err := dns01.FindZoneByFqdn(dns01.ToFqdn(domain))
+	authZone, err := dns01.FindZoneByFqdn(domain)
 	if err != nil {
-		return "", fmt.Errorf("could not find zone for domain %q: %w", domain, err)
+		return "", fmt.Errorf("could not find zone: %w", err)
 	}
 
-	zoneName := dns01.UnFqdn(authZone)
-	return zoneName, nil
+	return dns01.UnFqdn(authZone), nil
 }
 
 func findRecords(records []internal.Record, name string) *internal.Record {
@@ -220,18 +236,4 @@ func findRecords(records []internal.Record, name string) *internal.Record {
 	}
 
 	return nil
-}
-
-func containsValue(record *internal.Record, value string) bool {
-	for _, val := range record.Content {
-		if val == value {
-			return true
-		}
-	}
-
-	return false
-}
-
-func getRecordName(fqdn, authZone string) string {
-	return fqdn[0 : len(fqdn)-len(authZone)-2]
 }

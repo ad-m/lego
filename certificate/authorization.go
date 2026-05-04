@@ -7,18 +7,10 @@ import (
 	"github.com/go-acme/lego/v4/log"
 )
 
-const (
-	// overallRequestLimit is the overall number of request per second
-	// limited on the "new-reg", "new-authz" and "new-cert" endpoints.
-	// From the documentation the limitation is 20 requests per second,
-	// but using 20 as value doesn't work but 18 do.
-	overallRequestLimit = 18
-)
-
 func (c *Certifier) getAuthorizations(order acme.ExtendedOrder) ([]acme.Authorization, error) {
 	resc, errc := make(chan acme.Authorization), make(chan domainError)
 
-	delay := time.Second / overallRequestLimit
+	delay := time.Second / time.Duration(c.overallRequestLimit)
 
 	for _, authzURL := range order.Authorizations {
 		time.Sleep(delay)
@@ -35,13 +27,15 @@ func (c *Certifier) getAuthorizations(order acme.ExtendedOrder) ([]acme.Authoriz
 	}
 
 	var responses []acme.Authorization
-	failures := make(obtainError)
-	for i := 0; i < len(order.Authorizations); i++ {
+
+	failures := newObtainError()
+
+	for range len(order.Authorizations) {
 		select {
 		case res := <-resc:
 			responses = append(responses, res)
 		case err := <-errc:
-			failures[err.Domain] = err.Error
+			failures.Add(err.Domain, err.Error)
 		}
 	}
 
@@ -52,28 +46,24 @@ func (c *Certifier) getAuthorizations(order acme.ExtendedOrder) ([]acme.Authoriz
 	close(resc)
 	close(errc)
 
-	// be careful to not return an empty failures map;
-	// even if empty, they become non-nil error values
-	if len(failures) > 0 {
-		return responses, failures
-	}
-	return responses, nil
+	return responses, failures.Join()
 }
 
-func (c *Certifier) deactivateAuthorizations(order acme.ExtendedOrder) {
+func (c *Certifier) deactivateAuthorizations(order acme.ExtendedOrder, force bool) {
 	for _, authzURL := range order.Authorizations {
 		auth, err := c.core.Authorizations.Get(authzURL)
 		if err != nil {
-			log.Infof("Unable to get the authorization for: %s", authzURL)
+			log.Infof("Unable to get the authorization for %s: %v", authzURL, err)
 			continue
 		}
 
-		if auth.Status == acme.StatusValid {
+		if auth.Status == acme.StatusValid && !force {
 			log.Infof("Skipping deactivating of valid auth: %s", authzURL)
 			continue
 		}
 
 		log.Infof("Deactivating auth: %s", authzURL)
+
 		if c.core.Authorizations.Deactivate(authzURL) != nil {
 			log.Infof("Unable to deactivate the authorization: %s", authzURL)
 		}

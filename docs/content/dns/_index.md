@@ -5,6 +5,16 @@ draft: false
 weight: 3
 ---
 
+{{% notice important %}}
+lego is an independent, free, and open-source project, if you value it, consider [supporting it](https://donate.ldez.dev)! ❤️
+
+This project is not owned by a company. I'm not an employee of a company.
+
+I don't have gifted domains/accounts from DNS companies.
+
+I've been maintaining it for about 10 years.
+{{% /notice %}}
+
 ## Configuration and Credentials
 
 Credentials and DNS configuration for DNS providers must be passed through environment variables.
@@ -16,9 +26,9 @@ The environment variables can reference a value.
 Here is an example bash command using the Cloudflare DNS provider:
 
 ```bash
-$ CLOUDFLARE_EMAIL=foo@bar.com \
-CLOUDFLARE_API_KEY=b9841238feb177a84330febba8a83208921177bffe733 \
-lego --dns cloudflare --domains www.example.com --email me@bar.com run
+$ CLOUDFLARE_EMAIL=you@example.com \
+  CLOUDFLARE_API_KEY=b9841238feb177a84330febba8a83208921177bffe733 \
+  lego --dns cloudflare --domains www.example.com --email you@example.com run
 ```
 
 ### Environment Variables: File
@@ -38,18 +48,13 @@ $ cat /the/path/to/my/key
 b9841238feb177a84330febba8a83208921177bffe733
 
 $ cat /the/path/to/my/email
-foo@bar.com
+you@example.com
 
 $ CLOUDFLARE_EMAIL_FILE=/the/path/to/my/email \
-CLOUDFLARE_API_KEY_FILE=/the/path/to/my/key \
-lego --dns cloudflare --domains www.example.com --email me@bar.com run
+  CLOUDFLARE_API_KEY_FILE=/the/path/to/my/key \
+  lego --dns cloudflare --domains www.example.com --email you@example.com run
 ```
-
-## Experimental Features
-
-To resolve CNAME when creating dns-01 challenge:
-set `LEGO_EXPERIMENTAL_CNAME_SUPPORT` to `true`.
 
 ## DNS Providers
 
-{{%children style="h2" description="true" %}}
+{{% tableofdnsproviders %}}

@@ -1,28 +1,36 @@
 package internal
 
 import (
+	"bytes"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"os"
+	"path/filepath"
 	"testing"
-	"time"
 
+	"github.com/go-acme/lego/v4/platform/tester/servermock"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-func setupClientTest() (*http.ServeMux, *Client, func()) {
-	mux := http.NewServeMux()
-	server := httptest.NewServer(mux)
+func mockBuilder() *servermock.Builder[*Client] {
+	return servermock.NewBuilder[*Client](
+		func(server *httptest.Server) (*Client, error) {
+			client, err := NewClient("tyo1", "secret")
+			if err != nil {
+				return nil, err
+			}
 
-	client := &Client{
-		token:      "secret",
-		endpoint:   server.URL,
-		httpClient: &http.Client{Timeout: 5 * time.Second},
-	}
+			client.HTTPClient = server.Client()
+			client.baseURL, _ = url.Parse(server.URL)
 
-	return mux, client, server.Close
+			return client, nil
+		},
+		servermock.CheckHeader().WithJSONHeaders().
+			With("X-Auth-Token", "secret"))
 }
 
 func TestClient_GetDomainID(t *testing.T) {
@@ -34,98 +42,36 @@ func TestClient_GetDomainID(t *testing.T) {
 	testCases := []struct {
 		desc       string
 		domainName string
-		handler    http.HandlerFunc
+		response   string
 		expected   expected
 	}{
 		{
 			desc:       "success",
 			domainName: "domain1.com.",
-			handler: func(rw http.ResponseWriter, req *http.Request) {
-				if req.Method != http.MethodGet {
-					http.Error(rw, fmt.Sprintf("%s: %s", http.StatusText(http.StatusMethodNotAllowed), req.Method), http.StatusMethodNotAllowed)
-					return
-				}
-
-				content := `
-{
-    "domains":[
-      {
-        "id": "09494b72-b65b-4297-9efb-187f65a0553e",
-        "name": "domain1.com.",
-        "ttl": 3600,
-        "serial": 1351800668,
-        "email": "nsadmin@example.org",
-        "gslb": 0,
-        "created_at": "2012-11-01T20:11:08.000000",
-        "updated_at": null,
-        "description": "memo"
-      },
-      {
-        "id": "cf661142-e577-40b5-b3eb-75795cdc0cd7",
-        "name": "domain2.com.",
-        "ttl": 7200,
-        "serial": 1351800670,
-        "email": "nsadmin2@example.org",
-        "gslb": 1,
-        "created_at": "2012-11-01T20:11:08.000000",
-        "updated_at": "2012-12-01T20:11:08.000000",
-        "description": "memomemo"
-      }
-    ]
-}
-`
-				_, err := fmt.Fprint(rw, content)
-				if err != nil {
-					http.Error(rw, err.Error(), http.StatusInternalServerError)
-					return
-				}
-			},
-			expected: expected{domainID: "09494b72-b65b-4297-9efb-187f65a0553e"},
+			response:   "domains_GET.json",
+			expected:   expected{domainID: "09494b72-b65b-4297-9efb-187f65a0553e"},
 		},
 		{
 			desc:       "non existing domain",
 			domainName: "domain1.com.",
-			handler: func(rw http.ResponseWriter, req *http.Request) {
-				if req.Method != http.MethodGet {
-					http.Error(rw, fmt.Sprintf("%s: %s", http.StatusText(http.StatusMethodNotAllowed), req.Method), http.StatusMethodNotAllowed)
-					return
-				}
-
-				_, err := fmt.Fprint(rw, "{}")
-				if err != nil {
-					http.Error(rw, err.Error(), http.StatusInternalServerError)
-					return
-				}
-			},
-			expected: expected{error: true},
+			response:   "empty.json",
+			expected:   expected{error: true},
 		},
 		{
 			desc:       "marshaling error",
 			domainName: "domain1.com.",
-			handler: func(rw http.ResponseWriter, req *http.Request) {
-				if req.Method != http.MethodGet {
-					http.Error(rw, fmt.Sprintf("%s: %s", http.StatusText(http.StatusMethodNotAllowed), req.Method), http.StatusMethodNotAllowed)
-					return
-				}
-
-				_, err := fmt.Fprint(rw, "[]")
-				if err != nil {
-					http.Error(rw, err.Error(), http.StatusInternalServerError)
-					return
-				}
-			},
-			expected: expected{error: true},
+			response:   "empty.json",
+			expected:   expected{error: true},
 		},
 	}
 
 	for _, test := range testCases {
 		t.Run(test.desc, func(t *testing.T) {
-			mux, client, tearDown := setupClientTest()
-			defer tearDown()
+			client := mockBuilder().
+				Route("GET /v1/domains", servermock.ResponseFromFixture(test.response)).
+				Build(t)
 
-			mux.Handle("/v1/domains", test.handler)
-
-			domainID, err := client.GetDomainID(test.domainName)
+			domainID, err := client.GetDomainID(t.Context(), test.domainName)
 
 			if test.expected.error {
 				require.Error(t, err)
@@ -139,51 +85,52 @@ func TestClient_GetDomainID(t *testing.T) {
 
 func TestClient_CreateRecord(t *testing.T) {
 	testCases := []struct {
-		desc        string
-		handler     http.HandlerFunc
-		expectError bool
+		desc    string
+		handler http.HandlerFunc
+		assert  require.ErrorAssertionFunc
 	}{
 		{
 			desc: "success",
 			handler: func(rw http.ResponseWriter, req *http.Request) {
-				if req.Method != http.MethodPost {
-					http.Error(rw, fmt.Sprintf("%s: %s", http.StatusText(http.StatusMethodNotAllowed), req.Method), http.StatusMethodNotAllowed)
-					return
-				}
-
-				raw, err := ioutil.ReadAll(req.Body)
+				raw, err := io.ReadAll(req.Body)
 				if err != nil {
 					http.Error(rw, err.Error(), http.StatusBadRequest)
 					return
 				}
-				defer req.Body.Close()
 
-				if string(raw) != `{"name":"lego.com.","type":"TXT","data":"txtTXTtxt","ttl":300}` {
+				defer func() { _ = req.Body.Close() }()
+
+				if string(bytes.TrimSpace(raw)) != `{"name":"lego.com.","type":"TXT","data":"txtTXTtxt","ttl":300}` {
 					http.Error(rw, fmt.Sprintf("invalid request body: %s", string(raw)), http.StatusBadRequest)
 					return
 				}
+
+				file, err := os.Open(filepath.Join("fixtures", "domains-records_POST.json"))
+				if err != nil {
+					http.Error(rw, err.Error(), http.StatusInternalServerError)
+					return
+				}
+
+				defer func() { _ = file.Close() }()
+
+				_, _ = io.Copy(rw, file)
 			},
+			assert: require.NoError,
 		},
 		{
 			desc: "bad request",
 			handler: func(rw http.ResponseWriter, req *http.Request) {
-				if req.Method != http.MethodPost {
-					http.Error(rw, fmt.Sprintf("%s: %s", http.StatusText(http.StatusMethodNotAllowed), req.Method), http.StatusMethodNotAllowed)
-					return
-				}
-
 				http.Error(rw, "OOPS", http.StatusBadRequest)
 			},
-			expectError: true,
+			assert: require.Error,
 		},
 	}
 
 	for _, test := range testCases {
 		t.Run(test.desc, func(t *testing.T) {
-			mux, client, tearDown := setupClientTest()
-			defer tearDown()
-
-			mux.Handle("/v1/domains/lego/records", test.handler)
+			client := mockBuilder().
+				Route("POST /v1/domains/lego/records", test.handler).
+				Build(t)
 
 			domainID := "lego"
 
@@ -194,13 +141,30 @@ func TestClient_CreateRecord(t *testing.T) {
 				TTL:  300,
 			}
 
-			err := client.CreateRecord(domainID, record)
-
-			if test.expectError {
-				require.Error(t, err)
-			} else {
-				require.NoError(t, err)
-			}
+			err := client.CreateRecord(t.Context(), domainID, record)
+			test.assert(t, err)
 		})
 	}
+}
+
+func TestClient_GetRecordID(t *testing.T) {
+	client := mockBuilder().
+		Route("GET /v1/domains/89acac79-38e7-497d-807c-a011e1310438/records",
+			servermock.ResponseFromFixture("domains-records_GET.json")).
+		Build(t)
+
+	recordID, err := client.GetRecordID(t.Context(), "89acac79-38e7-497d-807c-a011e1310438", "www.example.com.", "A", "15.185.172.153")
+	require.NoError(t, err)
+
+	assert.Equal(t, "2e32e609-3a4f-45ba-bdef-e50eacd345ad", recordID)
+}
+
+func TestClient_DeleteRecord(t *testing.T) {
+	client := mockBuilder().
+		Route("DELETE /v1/domains/89acac79-38e7-497d-807c-a011e1310438/records/2e32e609-3a4f-45ba-bdef-e50eacd345ad",
+			servermock.ResponseFromFixture("domains-records_GET.json")).
+		Build(t)
+
+	err := client.DeleteRecord(t.Context(), "89acac79-38e7-497d-807c-a011e1310438", "2e32e609-3a4f-45ba-bdef-e50eacd345ad")
+	require.NoError(t, err)
 }

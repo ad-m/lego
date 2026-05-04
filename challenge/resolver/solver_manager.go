@@ -5,10 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"sort"
-	"strconv"
 	"time"
 
-	"github.com/cenkalti/backoff/v4"
+	"github.com/cenkalti/backoff/v5"
 	"github.com/go-acme/lego/v4/acme"
 	"github.com/go-acme/lego/v4/acme/api"
 	"github.com/go-acme/lego/v4/challenge"
@@ -16,6 +15,7 @@ import (
 	"github.com/go-acme/lego/v4/challenge/http01"
 	"github.com/go-acme/lego/v4/challenge/tlsalpn01"
 	"github.com/go-acme/lego/v4/log"
+	"github.com/go-acme/lego/v4/platform/wait"
 )
 
 type byType []acme.Challenge
@@ -37,14 +37,14 @@ func NewSolversManager(core *api.Core) *SolverManager {
 }
 
 // SetHTTP01Provider specifies a custom provider p that can solve the given HTTP-01 challenge.
-func (c *SolverManager) SetHTTP01Provider(p challenge.Provider) error {
-	c.solvers[challenge.HTTP01] = http01.NewChallenge(c.core, validate, p)
+func (c *SolverManager) SetHTTP01Provider(p challenge.Provider, opts ...http01.ChallengeOption) error {
+	c.solvers[challenge.HTTP01] = http01.NewChallenge(c.core, validate, p, opts...)
 	return nil
 }
 
 // SetTLSALPN01Provider specifies a custom provider p that can solve the given TLS-ALPN-01 challenge.
-func (c *SolverManager) SetTLSALPN01Provider(p challenge.Provider) error {
-	c.solvers[challenge.TLSALPN01] = tlsalpn01.NewChallenge(c.core, validate, p)
+func (c *SolverManager) SetTLSALPN01Provider(p challenge.Provider, opts ...tlsalpn01.ChallengeOption) error {
+	c.solvers[challenge.TLSALPN01] = tlsalpn01.NewChallenge(c.core, validate, p, opts...)
 	return nil
 }
 
@@ -54,7 +54,7 @@ func (c *SolverManager) SetDNS01Provider(p challenge.Provider, opts ...dns01.Cha
 	return nil
 }
 
-// Remove Remove a challenge type from the available solvers.
+// Remove removes a challenge type from the available solvers.
 func (c *SolverManager) Remove(chlgType challenge.Type) {
 	delete(c.solvers, chlgType)
 }
@@ -70,6 +70,7 @@ func (c *SolverManager) chooseSolver(authz acme.Authorization) solver {
 			log.Infof("[%s] acme: use %s solver", domain, chlg.Type)
 			return solvr
 		}
+
 		log.Infof("[%s] acme: Could not find solver for: %s", domain, chlg.Type)
 	}
 
@@ -92,36 +93,32 @@ func validate(core *api.Core, domain string, chlg acme.Challenge) error {
 		return nil
 	}
 
-	ra, err := strconv.Atoi(chlng.RetryAfter)
-	if err != nil {
+	retryAfter, err := api.ParseRetryAfter(chlng.RetryAfter)
+	if err != nil || retryAfter == 0 {
 		// The ACME server MUST return a Retry-After.
-		// If it doesn't, we'll just poll hard.
+		// If it doesn't, or if it's invalid, we'll just poll hard.
 		// Boulder does not implement the ability to retry challenges or the Retry-After header.
 		// https://github.com/letsencrypt/boulder/blob/master/docs/acme-divergences.md#section-82
-		ra = 5
+		retryAfter = 5 * time.Second
 	}
-	initialInterval := time.Duration(ra) * time.Second
+
+	ctx := context.Background()
 
 	bo := backoff.NewExponentialBackOff()
-	bo.InitialInterval = initialInterval
-	bo.MaxInterval = 10 * initialInterval
-	bo.MaxElapsedTime = 100 * initialInterval
-
-	ctx, cancel := context.WithCancel(context.Background())
+	bo.InitialInterval = retryAfter
+	bo.MaxInterval = 10 * retryAfter
 
 	// After the path is sent, the ACME server will access our server.
 	// Repeatedly check the server for an updated status on our request.
 	operation := func() error {
 		authz, err := core.Authorizations.Get(chlng.AuthorizationURL)
 		if err != nil {
-			cancel()
-			return err
+			return backoff.Permanent(err)
 		}
 
 		valid, err := checkAuthorizationStatus(authz)
 		if err != nil {
-			cancel()
-			return err
+			return backoff.Permanent(err)
 		}
 
 		if valid {
@@ -129,10 +126,12 @@ func validate(core *api.Core, domain string, chlg acme.Challenge) error {
 			return nil
 		}
 
-		return errors.New("the server didn't respond to our request")
+		return fmt.Errorf("the server didn't respond to our request (status=%s)", authz.Status)
 	}
 
-	return backoff.Retry(operation, backoff.WithContext(bo, ctx))
+	return wait.Retry(ctx, operation,
+		backoff.WithBackOff(bo),
+		backoff.WithMaxElapsedTime(100*retryAfter))
 }
 
 func checkChallengeStatus(chlng acme.ExtendedChallenge) (bool, error) {
@@ -142,9 +141,9 @@ func checkChallengeStatus(chlng acme.ExtendedChallenge) (bool, error) {
 	case acme.StatusPending, acme.StatusProcessing:
 		return false, nil
 	case acme.StatusInvalid:
-		return false, chlng.Error
+		return false, fmt.Errorf("invalid challenge: %w", chlng.Err())
 	default:
-		return false, errors.New("the server returned an unexpected state")
+		return false, fmt.Errorf("the server returned an unexpected challenge status: %s", chlng.Status)
 	}
 }
 
@@ -159,11 +158,12 @@ func checkAuthorizationStatus(authz acme.Authorization) (bool, error) {
 	case acme.StatusInvalid:
 		for _, chlg := range authz.Challenges {
 			if chlg.Status == acme.StatusInvalid && chlg.Error != nil {
-				return false, chlg.Error
+				return false, fmt.Errorf("invalid authorization: %w", chlg.Err())
 			}
 		}
-		return false, fmt.Errorf("the authorization state %s", authz.Status)
+
+		return false, errors.New("invalid authorization")
 	default:
-		return false, errors.New("the server returned an unexpected state")
+		return false, fmt.Errorf("the server returned an unexpected authorization status: %s", authz.Status)
 	}
 }

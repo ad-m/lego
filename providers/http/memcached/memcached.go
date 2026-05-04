@@ -1,5 +1,4 @@
-// Package memcached implements a HTTP provider for solving the HTTP-01 challenge using memcached
-// in combination with a webserver.
+// Package memcached implements an HTTP provider for solving the HTTP-01 challenge using memcached in combination with a webserver.
 package memcached
 
 import (
@@ -34,12 +33,14 @@ func (w *HTTPProvider) Present(domain, token, keyAuth string) error {
 	var errs []error
 
 	challengePath := path.Join("/", http01.ChallengePath(token))
+
 	for _, host := range w.hosts {
 		mc, err := memcache.New(host)
 		if err != nil {
 			errs = append(errs, err)
 			continue
 		}
+
 		_ = mc.Add(&memcache.Item{
 			Key:        challengePath,
 			Value:      []byte(keyAuth),

@@ -5,32 +5,50 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"strings"
 	"sync"
 	"time"
 
+	"github.com/go-acme/lego/v4/challenge"
 	"github.com/go-acme/lego/v4/challenge/dns01"
 	"github.com/go-acme/lego/v4/platform/config/env"
+	"github.com/go-acme/lego/v4/providers/dns/internal/clientdebug"
+	"github.com/go-acme/lego/v4/providers/dns/internal/useragent"
 	"github.com/ovh/go-ovh/ovh"
 )
 
 // OVH API reference:       https://eu.api.ovh.com/
-// Create a Token:					https://eu.api.ovh.com/createToken/
+// Create a Token:          https://eu.api.ovh.com/createToken/
+// Create a OAuth2 client:   https://eu.api.ovh.com/console/?section=%2Fme&branch=v1#post-/me/api/oauth2/client
 
 // Environment variables names.
 const (
 	envNamespace = "OVH_"
 
-	EnvEndpoint          = envNamespace + "ENDPOINT"
-	EnvApplicationKey    = envNamespace + "APPLICATION_KEY"
-	EnvApplicationSecret = envNamespace + "APPLICATION_SECRET"
-	EnvConsumerKey       = envNamespace + "CONSUMER_KEY"
+	EnvEndpoint = envNamespace + "ENDPOINT"
 
 	EnvTTL                = envNamespace + "TTL"
 	EnvPropagationTimeout = envNamespace + "PROPAGATION_TIMEOUT"
 	EnvPollingInterval    = envNamespace + "POLLING_INTERVAL"
 	EnvHTTPTimeout        = envNamespace + "HTTP_TIMEOUT"
 )
+
+// Authenticate using application key.
+const (
+	EnvApplicationKey    = envNamespace + "APPLICATION_KEY"
+	EnvApplicationSecret = envNamespace + "APPLICATION_SECRET"
+	EnvConsumerKey       = envNamespace + "CONSUMER_KEY"
+)
+
+// Authenticate using OAuth2 client.
+const (
+	EnvClientID     = envNamespace + "CLIENT_ID"
+	EnvClientSecret = envNamespace + "CLIENT_SECRET"
+)
+
+// EnvAccessToken Authenticate using Access Token client.
+const EnvAccessToken = envNamespace + "ACCESS_TOKEN"
+
+var _ challenge.ProviderTimeout = (*DNSProvider)(nil)
 
 // Record a DNS record.
 type Record struct {
@@ -42,12 +60,24 @@ type Record struct {
 	Zone      string `json:"zone,omitempty"`
 }
 
+// OAuth2Config the OAuth2 specific configuration.
+type OAuth2Config struct {
+	ClientID     string
+	ClientSecret string
+}
+
 // Config is used to configure the creation of the DNSProvider.
 type Config struct {
-	APIEndpoint        string
-	ApplicationKey     string
-	ApplicationSecret  string
-	ConsumerKey        string
+	APIEndpoint string
+
+	ApplicationKey    string
+	ApplicationSecret string
+	ConsumerKey       string
+
+	OAuth2Config *OAuth2Config
+
+	AccessToken string
+
 	PropagationTimeout time.Duration
 	PollingInterval    time.Duration
 	TTL                int
@@ -66,10 +96,15 @@ func NewDefaultConfig() *Config {
 	}
 }
 
+func (c *Config) hasAppKeyAuth() bool {
+	return c.ApplicationKey != "" || c.ApplicationSecret != "" || c.ConsumerKey != ""
+}
+
 // DNSProvider implements the challenge.Provider interface.
 type DNSProvider struct {
-	config      *Config
-	client      *ovh.Client
+	config *Config
+	client *ovh.Client
+
 	recordIDs   map[string]int64
 	recordIDsMu sync.Mutex
 }
@@ -78,16 +113,26 @@ type DNSProvider struct {
 // Credentials must be passed in the environment variables:
 // OVH_ENDPOINT (must be either "ovh-eu" or "ovh-ca"), OVH_APPLICATION_KEY, OVH_APPLICATION_SECRET, OVH_CONSUMER_KEY.
 func NewDNSProvider() (*DNSProvider, error) {
-	values, err := env.Get(EnvEndpoint, EnvApplicationKey, EnvApplicationSecret, EnvConsumerKey)
-	if err != nil {
-		return nil, fmt.Errorf("ovh: %w", err)
-	}
-
 	config := NewDefaultConfig()
-	config.APIEndpoint = values[EnvEndpoint]
-	config.ApplicationKey = values[EnvApplicationKey]
-	config.ApplicationSecret = values[EnvApplicationSecret]
-	config.ConsumerKey = values[EnvConsumerKey]
+
+	// https://github.com/ovh/go-ovh/blob/6817886d12a8c5650794b28da635af9fcdfd1162/ovh/configuration.go#L105
+	config.APIEndpoint = env.GetOrDefaultString(EnvEndpoint, "ovh-eu")
+
+	config.ApplicationKey = env.GetOrFile(EnvApplicationKey)
+	config.ApplicationSecret = env.GetOrFile(EnvApplicationSecret)
+	config.ConsumerKey = env.GetOrFile(EnvConsumerKey)
+
+	config.AccessToken = env.GetOrFile(EnvAccessToken)
+
+	clientID := env.GetOrFile(EnvClientID)
+	clientSecret := env.GetOrFile(EnvClientSecret)
+
+	if clientID != "" || clientSecret != "" {
+		config.OAuth2Config = &OAuth2Config{
+			ClientID:     clientID,
+			ClientSecret: clientSecret,
+		}
+	}
 
 	return NewDNSProviderConfig(config)
 }
@@ -98,21 +143,26 @@ func NewDNSProviderConfig(config *Config) (*DNSProvider, error) {
 		return nil, errors.New("ovh: the configuration of the DNS provider is nil")
 	}
 
-	if config.APIEndpoint == "" || config.ApplicationKey == "" || config.ApplicationSecret == "" || config.ConsumerKey == "" {
-		return nil, errors.New("ovh: credentials missing")
+	if config.OAuth2Config != nil && config.hasAppKeyAuth() && config.AccessToken != "" {
+		return nil, errors.New("ovh: can't use multiple authentication systems (ApplicationKey, OAuth2, Access Token)")
 	}
 
-	client, err := ovh.NewClient(
-		config.APIEndpoint,
-		config.ApplicationKey,
-		config.ApplicationSecret,
-		config.ConsumerKey,
-	)
+	if config.OAuth2Config != nil && config.AccessToken != "" {
+		return nil, errors.New("ovh: can't use multiple authentication systems (OAuth2, Access Token)")
+	}
+
+	if config.OAuth2Config != nil && config.hasAppKeyAuth() {
+		return nil, errors.New("ovh: can't use multiple authentication systems (ApplicationKey, OAuth2)")
+	}
+
+	if config.hasAppKeyAuth() && config.AccessToken != "" {
+		return nil, errors.New("ovh: can't use multiple authentication systems (ApplicationKey, Access Token)")
+	}
+
+	client, err := newClient(config)
 	if err != nil {
 		return nil, fmt.Errorf("ovh: %w", err)
 	}
-
-	client.Client = config.HTTPClient
 
 	return &DNSProvider{
 		config:    config,
@@ -123,22 +173,26 @@ func NewDNSProviderConfig(config *Config) (*DNSProvider, error) {
 
 // Present creates a TXT record to fulfill the dns-01 challenge.
 func (d *DNSProvider) Present(domain, token, keyAuth string) error {
-	fqdn, value := dns01.GetRecord(domain, keyAuth)
+	info := dns01.GetChallengeInfo(domain, keyAuth)
 
-	// Parse domain name
-	authZone, err := dns01.FindZoneByFqdn(dns01.ToFqdn(domain))
+	authZone, err := dns01.FindZoneByFqdn(info.EffectiveFQDN)
 	if err != nil {
-		return fmt.Errorf("ovh: could not determine zone for domain %q: %w", domain, err)
+		return fmt.Errorf("ovh: could not find zone for domain %q: %w", domain, err)
 	}
 
 	authZone = dns01.UnFqdn(authZone)
-	subDomain := extractRecordName(fqdn, authZone)
+
+	subDomain, err := dns01.ExtractSubDomain(info.EffectiveFQDN, authZone)
+	if err != nil {
+		return fmt.Errorf("ovh: %w", err)
+	}
 
 	reqURL := fmt.Sprintf("/domain/zone/%s/record", authZone)
-	reqData := Record{FieldType: "TXT", SubDomain: subDomain, Target: value, TTL: d.config.TTL}
+	reqData := Record{FieldType: "TXT", SubDomain: subDomain, Target: info.Value, TTL: d.config.TTL}
 
 	// Create TXT record
 	var respData Record
+
 	err = d.client.Post(reqURL, reqData, &respData)
 	if err != nil {
 		return fmt.Errorf("ovh: error when call api to add record (%s): %w", reqURL, err)
@@ -146,6 +200,7 @@ func (d *DNSProvider) Present(domain, token, keyAuth string) error {
 
 	// Apply the change
 	reqURL = fmt.Sprintf("/domain/zone/%s/refresh", authZone)
+
 	err = d.client.Post(reqURL, nil, nil)
 	if err != nil {
 		return fmt.Errorf("ovh: error when call api to refresh zone (%s): %w", reqURL, err)
@@ -160,19 +215,20 @@ func (d *DNSProvider) Present(domain, token, keyAuth string) error {
 
 // CleanUp removes the TXT record matching the specified parameters.
 func (d *DNSProvider) CleanUp(domain, token, keyAuth string) error {
-	fqdn, _ := dns01.GetRecord(domain, keyAuth)
+	info := dns01.GetChallengeInfo(domain, keyAuth)
 
 	// get the record's unique ID from when we created it
 	d.recordIDsMu.Lock()
 	recordID, ok := d.recordIDs[token]
 	d.recordIDsMu.Unlock()
+
 	if !ok {
-		return fmt.Errorf("ovh: unknown record ID for '%s'", fqdn)
+		return fmt.Errorf("ovh: unknown record ID for '%s'", info.EffectiveFQDN)
 	}
 
-	authZone, err := dns01.FindZoneByFqdn(dns01.ToFqdn(domain))
+	authZone, err := dns01.FindZoneByFqdn(info.EffectiveFQDN)
 	if err != nil {
-		return fmt.Errorf("ovh: could not determine zone for domain %q: %w", domain, err)
+		return fmt.Errorf("ovh: could not find zone for domain %q: %w", domain, err)
 	}
 
 	authZone = dns01.UnFqdn(authZone)
@@ -186,6 +242,7 @@ func (d *DNSProvider) CleanUp(domain, token, keyAuth string) error {
 
 	// Apply the change
 	reqURL = fmt.Sprintf("/domain/zone/%s/refresh", authZone)
+
 	err = d.client.Post(reqURL, nil, nil)
 	if err != nil {
 		return fmt.Errorf("ovh: error when call api to refresh zone (%s): %w", reqURL, err)
@@ -205,10 +262,34 @@ func (d *DNSProvider) Timeout() (timeout, interval time.Duration) {
 	return d.config.PropagationTimeout, d.config.PollingInterval
 }
 
-func extractRecordName(fqdn, zone string) string {
-	name := dns01.UnFqdn(fqdn)
-	if idx := strings.Index(name, "."+zone); idx != -1 {
-		return name[:idx]
+func newClient(config *Config) (*ovh.Client, error) {
+	var (
+		client *ovh.Client
+		err    error
+	)
+
+	switch {
+	case config.hasAppKeyAuth():
+		client, err = ovh.NewClient(config.APIEndpoint, config.ApplicationKey, config.ApplicationSecret, config.ConsumerKey)
+	case config.OAuth2Config != nil:
+		client, err = ovh.NewOAuth2Client(config.APIEndpoint, config.OAuth2Config.ClientID, config.OAuth2Config.ClientSecret)
+	case config.AccessToken != "":
+		client, err = ovh.NewAccessTokenClient(config.APIEndpoint, config.AccessToken)
+	default:
+		client, err = ovh.NewDefaultClient()
 	}
-	return name
+
+	if err != nil {
+		return nil, fmt.Errorf("new client: %w", err)
+	}
+
+	client.UserAgent = useragent.Get()
+
+	if config.HTTPClient != nil {
+		client.Client = config.HTTPClient
+	}
+
+	client.Client = clientdebug.Wrap(client.Client)
+
+	return client, nil
 }

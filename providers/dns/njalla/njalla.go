@@ -2,14 +2,17 @@
 package njalla
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
 	"sync"
 	"time"
 
+	"github.com/go-acme/lego/v4/challenge"
 	"github.com/go-acme/lego/v4/challenge/dns01"
 	"github.com/go-acme/lego/v4/platform/config/env"
+	"github.com/go-acme/lego/v4/providers/dns/internal/clientdebug"
 	"github.com/go-acme/lego/v4/providers/dns/njalla/internal"
 	"github.com/miekg/dns"
 )
@@ -25,6 +28,8 @@ const (
 	EnvPollingInterval    = envNamespace + "POLLING_INTERVAL"
 	EnvHTTPTimeout        = envNamespace + "HTTP_TIMEOUT"
 )
+
+var _ challenge.ProviderTimeout = (*DNSProvider)(nil)
 
 // Config is used to configure the creation of the DNSProvider.
 type Config struct {
@@ -52,7 +57,7 @@ type DNSProvider struct {
 	config *Config
 	client *internal.Client
 
-	recordIDs   map[string]int
+	recordIDs   map[string]string
 	recordIDsMu sync.Mutex
 }
 
@@ -86,10 +91,12 @@ func NewDNSProviderConfig(config *Config) (*DNSProvider, error) {
 		client.HTTPClient = config.HTTPClient
 	}
 
+	client.HTTPClient = clientdebug.Wrap(client.HTTPClient)
+
 	return &DNSProvider{
 		config:    config,
 		client:    client,
-		recordIDs: make(map[string]int),
+		recordIDs: make(map[string]string),
 	}, nil
 }
 
@@ -101,9 +108,9 @@ func (d *DNSProvider) Timeout() (timeout, interval time.Duration) {
 
 // Present creates a TXT record using the specified parameters.
 func (d *DNSProvider) Present(domain, token, keyAuth string) error {
-	fqdn, value := dns01.GetRecord(domain, keyAuth)
+	info := dns01.GetChallengeInfo(domain, keyAuth)
 
-	rootDomain, subDomain, err := splitDomain(fqdn)
+	rootDomain, subDomain, err := splitDomain(info.EffectiveFQDN)
 	if err != nil {
 		return fmt.Errorf("njalla: %w", err)
 	}
@@ -111,12 +118,12 @@ func (d *DNSProvider) Present(domain, token, keyAuth string) error {
 	record := internal.Record{
 		Name:    subDomain,                // TODO need to be tested
 		Domain:  dns01.UnFqdn(rootDomain), // TODO need to be tested
-		Content: value,
+		Content: info.Value,
 		TTL:     d.config.TTL,
 		Type:    "TXT",
 	}
 
-	resp, err := d.client.AddRecord(record)
+	resp, err := d.client.AddRecord(context.Background(), record)
 	if err != nil {
 		return fmt.Errorf("njalla: failed to add record: %w", err)
 	}
@@ -130,9 +137,9 @@ func (d *DNSProvider) Present(domain, token, keyAuth string) error {
 
 // CleanUp removes the TXT record matching the specified parameters.
 func (d *DNSProvider) CleanUp(domain, token, keyAuth string) error {
-	fqdn, _ := dns01.GetRecord(domain, keyAuth)
+	info := dns01.GetChallengeInfo(domain, keyAuth)
 
-	rootDomain, _, err := splitDomain(fqdn)
+	rootDomain, _, err := splitDomain(info.EffectiveFQDN)
 	if err != nil {
 		return fmt.Errorf("njalla: %w", err)
 	}
@@ -141,13 +148,14 @@ func (d *DNSProvider) CleanUp(domain, token, keyAuth string) error {
 	d.recordIDsMu.Lock()
 	recordID, ok := d.recordIDs[token]
 	d.recordIDsMu.Unlock()
+
 	if !ok {
-		return fmt.Errorf("njalla: unknown record ID for '%s' '%s'", fqdn, token)
+		return fmt.Errorf("njalla: unknown record ID for '%s' '%s'", info.EffectiveFQDN, token)
 	}
 
-	err = d.client.RemoveRecord(recordID, dns01.UnFqdn(rootDomain))
+	err = d.client.RemoveRecord(context.Background(), recordID, dns01.UnFqdn(rootDomain))
 	if err != nil {
-		return fmt.Errorf("njalla: failed to delete TXT records: fqdn=%s, recordID=%d: %w", fqdn, recordID, err)
+		return fmt.Errorf("njalla: failed to delete TXT records: fqdn=%s, recordID=%s: %w", info.EffectiveFQDN, recordID, err)
 	}
 
 	// deletes record ID from map

@@ -2,19 +2,16 @@
 package namesilo
 
 import (
+	"context"
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 
+	"github.com/go-acme/lego/v4/challenge"
 	"github.com/go-acme/lego/v4/challenge/dns01"
 	"github.com/go-acme/lego/v4/platform/config/env"
+	"github.com/go-acme/lego/v4/providers/dns/internal/clientdebug"
 	"github.com/nrdcg/namesilo"
-)
-
-const (
-	defaultTTL = 3600
-	maxTTL     = 2592000
 )
 
 // Environment variables names.
@@ -27,6 +24,13 @@ const (
 	EnvPropagationTimeout = envNamespace + "PROPAGATION_TIMEOUT"
 	EnvPollingInterval    = envNamespace + "POLLING_INTERVAL"
 )
+
+const (
+	defaultTTL = 3600
+	maxTTL     = 2592000
+)
+
+var _ challenge.ProviderTimeout = (*DNSProvider)(nil)
 
 // Config is used to configure the creation of the DNSProvider.
 type Config struct {
@@ -77,77 +81,86 @@ func NewDNSProviderConfig(config *Config) (*DNSProvider, error) {
 		return nil, fmt.Errorf("namesilo: TTL should be in [%d, %d]", defaultTTL, maxTTL)
 	}
 
-	transport, err := namesilo.NewTokenTransport(config.APIKey)
-	if err != nil {
-		return nil, fmt.Errorf("namesilo: %w", err)
+	if config.APIKey == "" {
+		return nil, errors.New("namesilo: credentials missing")
 	}
 
-	return &DNSProvider{client: namesilo.NewClient(transport.Client()), config: config}, nil
+	client := namesilo.NewClient(config.APIKey)
+
+	client.HTTPClient = clientdebug.Wrap(client.HTTPClient)
+
+	return &DNSProvider{client: client, config: config}, nil
 }
 
 // Present creates a TXT record to fulfill the dns-01 challenge.
 func (d *DNSProvider) Present(domain, token, keyAuth string) error {
-	fqdn, value := dns01.GetRecord(domain, keyAuth)
+	info := dns01.GetChallengeInfo(domain, keyAuth)
 
-	zoneName, err := getZoneNameByDomain(domain)
+	zone, err := dns01.FindZoneByFqdn(info.EffectiveFQDN)
+	if err != nil {
+		return fmt.Errorf("namesilo: could not find zone for domain %q: %w", domain, err)
+	}
+
+	zoneName := dns01.UnFqdn(zone)
+
+	subdomain, err := dns01.ExtractSubDomain(info.EffectiveFQDN, zoneName)
 	if err != nil {
 		return fmt.Errorf("namesilo: %w", err)
 	}
 
-	_, err = d.client.DnsAddRecord(&namesilo.DnsAddRecordParams{
+	_, err = d.client.DnsAddRecord(context.Background(), &namesilo.DnsAddRecordParams{
 		Domain: zoneName,
 		Type:   "TXT",
-		Host:   getRecordName(fqdn, zoneName),
-		Value:  value,
+		Host:   subdomain,
+		Value:  info.Value,
 		TTL:    d.config.TTL,
 	})
 	if err != nil {
 		return fmt.Errorf("namesilo: failed to add record %w", err)
 	}
+
 	return nil
 }
 
 // CleanUp removes the TXT record matching the specified parameters.
-func (d *DNSProvider) CleanUp(domain, token, keyAuth string) error {
-	fqdn, _ := dns01.GetRecord(domain, keyAuth)
+func (d *DNSProvider) CleanUp(domain, _, keyAuth string) error {
+	ctx := context.Background()
 
-	zoneName, err := getZoneNameByDomain(domain)
+	info := dns01.GetChallengeInfo(domain, keyAuth)
+
+	zone, err := dns01.FindZoneByFqdn(info.EffectiveFQDN)
+	if err != nil {
+		return fmt.Errorf("namesilo: could not find zone for domain %q: %w", domain, err)
+	}
+
+	zoneName := dns01.UnFqdn(zone)
+
+	resp, err := d.client.DnsListRecords(ctx, &namesilo.DnsListRecordsParams{Domain: zoneName})
 	if err != nil {
 		return fmt.Errorf("namesilo: %w", err)
 	}
 
-	resp, err := d.client.DnsListRecords(&namesilo.DnsListRecordsParams{Domain: zoneName})
+	subdomain, err := dns01.ExtractSubDomain(info.EffectiveFQDN, zoneName)
 	if err != nil {
 		return fmt.Errorf("namesilo: %w", err)
 	}
 
-	var lastErr error
-	name := getRecordName(fqdn, zoneName)
 	for _, r := range resp.Reply.ResourceRecord {
-		if r.Type == "TXT" && (r.Host == name || r.Host == dns01.UnFqdn(fqdn)) {
-			_, err := d.client.DnsDeleteRecord(&namesilo.DnsDeleteRecordParams{Domain: zoneName, ID: r.RecordID})
+		if r.Type == "TXT" && r.Value == info.Value && (r.Host == subdomain || r.Host == dns01.UnFqdn(info.EffectiveFQDN)) {
+			_, err := d.client.DnsDeleteRecord(ctx, &namesilo.DnsDeleteRecordParams{Domain: zoneName, ID: r.RecordID})
 			if err != nil {
-				lastErr = fmt.Errorf("namesilo: %w", err)
+				return fmt.Errorf("namesilo: %w", err)
 			}
+
+			return nil
 		}
 	}
-	return lastErr
+
+	return fmt.Errorf("namesilo: no TXT record to delete for %s (%s)", info.EffectiveFQDN, info.Value)
 }
 
 // Timeout returns the timeout and interval to use when checking for DNS propagation.
 // Adjusting here to cope with spikes in propagation times.
 func (d *DNSProvider) Timeout() (timeout, interval time.Duration) {
 	return d.config.PropagationTimeout, d.config.PollingInterval
-}
-
-func getZoneNameByDomain(domain string) (string, error) {
-	zone, err := dns01.FindZoneByFqdn(dns01.ToFqdn(domain))
-	if err != nil {
-		return "", fmt.Errorf("failed to find zone for domain: %s, %w", domain, err)
-	}
-	return dns01.UnFqdn(zone), nil
-}
-
-func getRecordName(domain, zone string) string {
-	return strings.TrimSuffix(dns01.ToFqdn(domain), "."+dns01.ToFqdn(zone))
 }

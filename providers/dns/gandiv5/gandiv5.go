@@ -2,36 +2,38 @@
 package gandiv5
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
-	"strings"
+	"net/url"
 	"sync"
 	"time"
 
+	"github.com/go-acme/lego/v4/challenge"
 	"github.com/go-acme/lego/v4/challenge/dns01"
+	"github.com/go-acme/lego/v4/log"
 	"github.com/go-acme/lego/v4/platform/config/env"
-)
-
-// Gandi API reference:       http://doc.livedns.gandi.net/
-
-const (
-	// defaultBaseURL endpoint is the Gandi API endpoint used by Present and CleanUp.
-	defaultBaseURL = "https://dns.api.gandi.net/api/v5"
-	minTTL         = 300
+	"github.com/go-acme/lego/v4/providers/dns/gandiv5/internal"
+	"github.com/go-acme/lego/v4/providers/dns/internal/clientdebug"
 )
 
 // Environment variables names.
 const (
 	envNamespace = "GANDIV5_"
 
-	EnvAPIKey = envNamespace + "API_KEY"
+	EnvAPIKey              = envNamespace + "API_KEY"
+	EnvPersonalAccessToken = envNamespace + "PERSONAL_ACCESS_TOKEN"
 
 	EnvTTL                = envNamespace + "TTL"
 	EnvPropagationTimeout = envNamespace + "PROPAGATION_TIMEOUT"
 	EnvPollingInterval    = envNamespace + "POLLING_INTERVAL"
 	EnvHTTPTimeout        = envNamespace + "HTTP_TIMEOUT"
 )
+
+const minTTL = 300
+
+var _ challenge.ProviderTimeout = (*DNSProvider)(nil)
 
 // inProgressInfo contains information about an in-progress challenge.
 type inProgressInfo struct {
@@ -41,12 +43,13 @@ type inProgressInfo struct {
 
 // Config is used to configure the creation of the DNSProvider.
 type Config struct {
-	BaseURL            string
-	APIKey             string
-	PropagationTimeout time.Duration
-	PollingInterval    time.Duration
-	TTL                int
-	HTTPClient         *http.Client
+	BaseURL             string
+	APIKey              string // Deprecated use PersonalAccessToken
+	PersonalAccessToken string
+	PropagationTimeout  time.Duration
+	PollingInterval     time.Duration
+	TTL                 int
+	HTTPClient          *http.Client
 }
 
 // NewDefaultConfig returns a default configuration for the DNSProvider.
@@ -63,23 +66,25 @@ func NewDefaultConfig() *Config {
 
 // DNSProvider implements the challenge.Provider interface.
 type DNSProvider struct {
-	config          *Config
+	config *Config
+	client *internal.Client
+
 	inProgressFQDNs map[string]inProgressInfo
 	inProgressMu    sync.Mutex
-	// findZoneByFqdn determines the DNS zone of an fqdn. It is overridden during tests.
+
+	// findZoneByFqdn determines the DNS zone of a FQDN.
+	// It is overridden during tests.
+	// only for testing purpose.
 	findZoneByFqdn func(fqdn string) (string, error)
 }
 
 // NewDNSProvider returns a DNSProvider instance configured for Gandi.
 // Credentials must be passed in the environment variable: GANDIV5_API_KEY.
 func NewDNSProvider() (*DNSProvider, error) {
-	values, err := env.Get(EnvAPIKey)
-	if err != nil {
-		return nil, fmt.Errorf("gandi: %w", err)
-	}
-
+	// TODO(ldez): rewrite this when APIKey will be removed.
 	config := NewDefaultConfig()
-	config.APIKey = values[EnvAPIKey]
+	config.APIKey = env.GetOrFile(EnvAPIKey)
+	config.PersonalAccessToken = env.GetOrFile(EnvPersonalAccessToken)
 
 	return NewDNSProviderConfig(config)
 }
@@ -90,20 +95,38 @@ func NewDNSProviderConfig(config *Config) (*DNSProvider, error) {
 		return nil, errors.New("gandiv5: the configuration of the DNS provider is nil")
 	}
 
-	if config.APIKey == "" {
-		return nil, errors.New("gandiv5: no API Key given")
+	if config.APIKey != "" {
+		log.Print("gandiv5: API Key is deprecated, use Personal Access Token instead")
 	}
 
-	if config.BaseURL == "" {
-		config.BaseURL = defaultBaseURL
+	if config.APIKey == "" && config.PersonalAccessToken == "" {
+		return nil, errors.New("gandiv5: credentials information are missing")
 	}
 
 	if config.TTL < minTTL {
 		return nil, fmt.Errorf("gandiv5: invalid TTL, TTL (%d) must be greater than %d", config.TTL, minTTL)
 	}
 
+	client := internal.NewClient(config.APIKey, config.PersonalAccessToken)
+
+	if config.BaseURL != "" {
+		baseURL, err := url.Parse(config.BaseURL)
+		if err != nil {
+			return nil, fmt.Errorf("gandiv5: %w", err)
+		}
+
+		client.BaseURL = baseURL
+	}
+
+	if config.HTTPClient != nil {
+		client.HTTPClient = config.HTTPClient
+	}
+
+	client.HTTPClient = clientdebug.Wrap(client.HTTPClient)
+
 	return &DNSProvider{
 		config:          config,
+		client:          client,
 		inProgressFQDNs: make(map[string]inProgressInfo),
 		findZoneByFqdn:  dns01.FindZoneByFqdn,
 	}, nil
@@ -111,20 +134,19 @@ func NewDNSProviderConfig(config *Config) (*DNSProvider, error) {
 
 // Present creates a TXT record using the specified parameters.
 func (d *DNSProvider) Present(domain, token, keyAuth string) error {
-	fqdn, value := dns01.GetRecord(domain, keyAuth)
+	info := dns01.GetChallengeInfo(domain, keyAuth)
 
 	// find authZone
-	authZone, err := d.findZoneByFqdn(fqdn)
+	authZone, err := d.findZoneByFqdn(info.EffectiveFQDN)
 	if err != nil {
-		return fmt.Errorf("gandiv5: findZoneByFqdn failure: %w", err)
+		return fmt.Errorf("gandiv5: could not find zone for domain %q: %w", domain, err)
 	}
 
 	// determine name of TXT record
-	if !strings.HasSuffix(
-		strings.ToLower(fqdn), strings.ToLower("."+authZone)) {
-		return fmt.Errorf("gandiv5: unexpected authZone %s for fqdn %s", authZone, fqdn)
+	subDomain, err := dns01.ExtractSubDomain(info.EffectiveFQDN, authZone)
+	if err != nil {
+		return fmt.Errorf("gandiv5: %w", err)
 	}
-	name := fqdn[:len(fqdn)-len("."+authZone)]
 
 	// acquire lock and check there is not a challenge already in
 	// progress for this value of authZone
@@ -132,40 +154,43 @@ func (d *DNSProvider) Present(domain, token, keyAuth string) error {
 	defer d.inProgressMu.Unlock()
 
 	// add TXT record into authZone
-	err = d.addTXTRecord(dns01.UnFqdn(authZone), name, value, d.config.TTL)
+	err = d.client.AddTXTRecord(context.Background(), dns01.UnFqdn(authZone), subDomain, info.Value, d.config.TTL)
 	if err != nil {
 		return err
 	}
 
 	// save data necessary for CleanUp
-	d.inProgressFQDNs[fqdn] = inProgressInfo{
+	d.inProgressFQDNs[info.EffectiveFQDN] = inProgressInfo{
 		authZone:  authZone,
-		fieldName: name,
+		fieldName: subDomain,
 	}
+
 	return nil
 }
 
 // CleanUp removes the TXT record matching the specified parameters.
 func (d *DNSProvider) CleanUp(domain, token, keyAuth string) error {
-	fqdn, _ := dns01.GetRecord(domain, keyAuth)
+	info := dns01.GetChallengeInfo(domain, keyAuth)
 
 	// acquire lock and retrieve authZone
 	d.inProgressMu.Lock()
 	defer d.inProgressMu.Unlock()
-	if _, ok := d.inProgressFQDNs[fqdn]; !ok {
+
+	if _, ok := d.inProgressFQDNs[info.EffectiveFQDN]; !ok {
 		// if there is no cleanup information then just return
 		return nil
 	}
 
-	fieldName := d.inProgressFQDNs[fqdn].fieldName
-	authZone := d.inProgressFQDNs[fqdn].authZone
-	delete(d.inProgressFQDNs, fqdn)
+	fieldName := d.inProgressFQDNs[info.EffectiveFQDN].fieldName
+	authZone := d.inProgressFQDNs[info.EffectiveFQDN].authZone
+	delete(d.inProgressFQDNs, info.EffectiveFQDN)
 
 	// delete TXT record from authZone
-	err := d.deleteTXTRecord(dns01.UnFqdn(authZone), fieldName)
+	err := d.client.DeleteTXTRecord(context.Background(), dns01.UnFqdn(authZone), fieldName)
 	if err != nil {
 		return fmt.Errorf("gandiv5: %w", err)
 	}
+
 	return nil
 }
 

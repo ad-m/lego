@@ -5,12 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"strings"
 	"time"
 
+	"github.com/go-acme/lego/v4/challenge"
 	"github.com/go-acme/lego/v4/challenge/dns01"
 	"github.com/go-acme/lego/v4/log"
 	"github.com/go-acme/lego/v4/platform/config/env"
+	"github.com/go-acme/lego/v4/providers/dns/internal/clientdebug"
 	"gopkg.in/ns1/ns1-go.v2/rest"
 	"gopkg.in/ns1/ns1-go.v2/rest/model/dns"
 )
@@ -26,6 +27,8 @@ const (
 	EnvPollingInterval    = envNamespace + "POLLING_INTERVAL"
 	EnvHTTPTimeout        = envNamespace + "HTTP_TIMEOUT"
 )
+
+var _ challenge.ProviderTimeout = (*DNSProvider)(nil)
 
 // Config is used to configure the creation of the DNSProvider.
 type Config struct {
@@ -78,33 +81,40 @@ func NewDNSProviderConfig(config *Config) (*DNSProvider, error) {
 		return nil, errors.New("ns1: credentials missing")
 	}
 
-	client := rest.NewClient(config.HTTPClient, rest.SetAPIKey(config.APIKey))
+	if config.HTTPClient == nil {
+		// Because the rest.NewClient uses the http.DefaultClient.
+		config.HTTPClient = &http.Client{Timeout: 10 * time.Second}
+	}
+
+	client := rest.NewClient(clientdebug.Wrap(config.HTTPClient), rest.SetAPIKey(config.APIKey))
 
 	return &DNSProvider{client: client, config: config}, nil
 }
 
 // Present creates a TXT record to fulfill the dns-01 challenge.
 func (d *DNSProvider) Present(domain, token, keyAuth string) error {
-	fqdn, value := dns01.GetRecord(domain, keyAuth)
+	info := dns01.GetChallengeInfo(domain, keyAuth)
 
-	zone, err := d.getHostedZone(fqdn)
+	zone, err := d.getHostedZone(info.EffectiveFQDN)
 	if err != nil {
 		return fmt.Errorf("ns1: %w", err)
 	}
 
-	record, _, err := d.client.Records.Get(zone.Zone, dns01.UnFqdn(fqdn), "TXT")
+	record, _, err := d.client.Records.Get(zone.Zone, dns01.UnFqdn(info.EffectiveFQDN), "TXT")
 
 	// Create a new record
 	if errors.Is(err, rest.ErrRecordMissing) || record == nil {
-		log.Infof("Create a new record for [zone: %s, fqdn: %s, domain: %s]", zone.Zone, fqdn, domain)
+		log.Infof("Create a new record for [zone: %s, fqdn: %s, domain: %s]", zone.Zone, info.EffectiveFQDN, domain)
 
-		record = dns.NewRecord(zone.Zone, dns01.UnFqdn(fqdn), "TXT")
+		// Work through a bug in the NS1 API library that causes 400 Input validation failed (Value None for field '<obj>.filters' is not of type ...)
+		// So the `tags` and `blockedTags` parameters should be initialized to empty.
+		record = dns.NewRecord(zone.Zone, dns01.UnFqdn(info.EffectiveFQDN), "TXT", make(map[string]string), make([]string, 0))
 		record.TTL = d.config.TTL
-		record.Answers = []*dns.Answer{{Rdata: []string{value}}}
+		record.Answers = []*dns.Answer{{Rdata: []string{info.Value}}}
 
 		_, err = d.client.Records.Create(record)
 		if err != nil {
-			return fmt.Errorf("ns1: failed to create record [zone: %q, fqdn: %q]: %w", zone.Zone, fqdn, err)
+			return fmt.Errorf("ns1: failed to create record [zone: %q, fqdn: %q]: %w", zone.Zone, info.EffectiveFQDN, err)
 		}
 
 		return nil
@@ -115,13 +125,13 @@ func (d *DNSProvider) Present(domain, token, keyAuth string) error {
 	}
 
 	// Update the existing records
-	record.Answers = append(record.Answers, &dns.Answer{Rdata: []string{value}})
+	record.Answers = append(record.Answers, &dns.Answer{Rdata: []string{info.Value}})
 
-	log.Infof("Update an existing record for [zone: %s, fqdn: %s, domain: %s]", zone.Zone, fqdn, domain)
+	log.Infof("Update an existing record for [zone: %s, fqdn: %s, domain: %s]", zone.Zone, info.EffectiveFQDN, domain)
 
 	_, err = d.client.Records.Update(record)
 	if err != nil {
-		return fmt.Errorf("ns1: failed to update record [zone: %q, fqdn: %q]: %w", zone.Zone, fqdn, err)
+		return fmt.Errorf("ns1: failed to update record [zone: %q, fqdn: %q]: %w", zone.Zone, info.EffectiveFQDN, err)
 	}
 
 	return nil
@@ -129,18 +139,20 @@ func (d *DNSProvider) Present(domain, token, keyAuth string) error {
 
 // CleanUp removes the TXT record matching the specified parameters.
 func (d *DNSProvider) CleanUp(domain, token, keyAuth string) error {
-	fqdn, _ := dns01.GetRecord(domain, keyAuth)
+	info := dns01.GetChallengeInfo(domain, keyAuth)
 
-	zone, err := d.getHostedZone(fqdn)
+	zone, err := d.getHostedZone(info.EffectiveFQDN)
 	if err != nil {
 		return fmt.Errorf("ns1: %w", err)
 	}
 
-	name := dns01.UnFqdn(fqdn)
+	name := dns01.UnFqdn(info.EffectiveFQDN)
+
 	_, err = d.client.Records.Delete(zone.Zone, name, "TXT")
 	if err != nil {
 		return fmt.Errorf("ns1: failed to delete record [zone: %q, domain: %q]: %w", zone.Zone, name, err)
 	}
+
 	return nil
 }
 
@@ -151,24 +163,17 @@ func (d *DNSProvider) Timeout() (timeout, interval time.Duration) {
 }
 
 func (d *DNSProvider) getHostedZone(fqdn string) (*dns.Zone, error) {
-	authZone, err := getAuthZone(fqdn)
+	authZone, err := dns01.FindZoneByFqdn(fqdn)
 	if err != nil {
-		return nil, fmt.Errorf("failed to extract auth zone from fqdn %q: %w", fqdn, err)
+		return nil, fmt.Errorf("could not find zone: %w", err)
 	}
 
-	zone, _, err := d.client.Zones.Get(authZone)
+	authZone = dns01.UnFqdn(authZone)
+
+	zone, _, err := d.client.Zones.Get(authZone, false)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get zone [authZone: %q, fqdn: %q]: %w", authZone, fqdn, err)
 	}
 
 	return zone, nil
-}
-
-func getAuthZone(fqdn string) (string, error) {
-	authZone, err := dns01.FindZoneByFqdn(fqdn)
-	if err != nil {
-		return "", err
-	}
-
-	return strings.TrimSuffix(authZone, "."), nil
 }

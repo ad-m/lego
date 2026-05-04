@@ -2,13 +2,17 @@
 package desec
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"time"
 
+	"github.com/go-acme/lego/v4/challenge"
 	"github.com/go-acme/lego/v4/challenge/dns01"
 	"github.com/go-acme/lego/v4/platform/config/env"
+	"github.com/go-acme/lego/v4/providers/dns/internal/clientdebug"
 	"github.com/nrdcg/desec"
 )
 
@@ -28,6 +32,8 @@ const (
 // https://desec.readthedocs.io/_/downloads/en/latest/pdf/
 const defaultTTL int = 3600
 
+var _ challenge.ProviderTimeout = (*DNSProvider)(nil)
+
 // Config is used to configure the creation of the DNSProvider.
 type Config struct {
 	Token              string
@@ -41,8 +47,8 @@ type Config struct {
 func NewDefaultConfig() *Config {
 	return &Config{
 		TTL:                env.GetOrDefaultInt(EnvTTL, defaultTTL),
-		PropagationTimeout: env.GetOrDefaultSecond(EnvPropagationTimeout, dns01.DefaultPropagationTimeout),
-		PollingInterval:    env.GetOrDefaultSecond(EnvPollingInterval, dns01.DefaultPollingInterval),
+		PropagationTimeout: env.GetOrDefaultSecond(EnvPropagationTimeout, 120*time.Second),
+		PollingInterval:    env.GetOrDefaultSecond(EnvPollingInterval, 4*time.Second),
 		HTTPClient: &http.Client{
 			Timeout: env.GetOrDefaultSecond(EnvHTTPTimeout, 30*time.Second),
 		},
@@ -84,6 +90,10 @@ func NewDNSProviderConfig(config *Config) (*DNSProvider, error) {
 		opts.HTTPClient = config.HTTPClient
 	}
 
+	opts.HTTPClient = clientdebug.Wrap(opts.HTTPClient)
+
+	opts.Logger = log.Default()
+
 	client := desec.New(config.Token, opts)
 
 	return &DNSProvider{config: config, client: client}, nil
@@ -97,27 +107,32 @@ func (d *DNSProvider) Timeout() (timeout, interval time.Duration) {
 
 // Present creates a TXT record using the specified parameters.
 func (d *DNSProvider) Present(domain, token, keyAuth string) error {
-	fqdn, value := dns01.GetRecord(domain, keyAuth)
-	quotedValue := fmt.Sprintf(`"%s"`, value)
+	ctx := context.Background()
+	info := dns01.GetChallengeInfo(domain, keyAuth)
 
-	authZone, err := dns01.FindZoneByFqdn(fqdn)
+	responsibleDomain, err := d.client.Domains.GetResponsible(ctx, dns01.UnFqdn(info.EffectiveFQDN))
 	if err != nil {
-		return fmt.Errorf("desec: could not find zone for domain %q and fqdn %q : %w", domain, fqdn, err)
+		return fmt.Errorf("desec: get responsible domain: %w", err)
 	}
 
-	recordName := getRecordName(fqdn, authZone)
-
-	domainName := dns01.UnFqdn(authZone)
-
-	rrSet, err := d.client.Records.Get(domainName, recordName, "TXT")
+	recordName, err := dns01.ExtractSubDomain(info.EffectiveFQDN, responsibleDomain.Name)
 	if err != nil {
-		var nf *desec.NotFound
+		return fmt.Errorf("desec: %w", err)
+	}
+
+	domainName := dns01.UnFqdn(responsibleDomain.Name)
+
+	quotedValue := fmt.Sprintf(`%q`, info.Value)
+
+	rrSet, err := d.client.Records.Get(ctx, domainName, recordName, "TXT")
+	if err != nil {
+		var nf *desec.NotFoundError
 		if !errors.As(err, &nf) {
 			return fmt.Errorf("desec: failed to get records: domainName=%s, recordName=%s: %w", domainName, recordName, err)
 		}
 
 		// Not found case -> create
-		_, err = d.client.Records.Create(desec.RRSet{
+		_, err = d.client.Records.Create(ctx, desec.RRSet{
 			Domain:  domainName,
 			SubName: recordName,
 			Type:    "TXT",
@@ -134,7 +149,7 @@ func (d *DNSProvider) Present(domain, token, keyAuth string) error {
 	// update
 	records := append(rrSet.Records, quotedValue)
 
-	_, err = d.client.Records.Update(domainName, recordName, "TXT", desec.RRSet{Records: records})
+	_, err = d.client.Records.Update(ctx, domainName, recordName, "TXT", desec.RRSet{Records: records})
 	if err != nil {
 		return fmt.Errorf("desec: failed to update records: domainName=%s, recordName=%s: %w", domainName, recordName, err)
 	}
@@ -144,37 +159,38 @@ func (d *DNSProvider) Present(domain, token, keyAuth string) error {
 
 // CleanUp removes the TXT record matching the specified parameters.
 func (d *DNSProvider) CleanUp(domain, token, keyAuth string) error {
-	fqdn, value := dns01.GetRecord(domain, keyAuth)
+	ctx := context.Background()
+	info := dns01.GetChallengeInfo(domain, keyAuth)
 
-	authZone, err := dns01.FindZoneByFqdn(fqdn)
+	responsibleDomain, err := d.client.Domains.GetResponsible(ctx, dns01.UnFqdn(info.EffectiveFQDN))
 	if err != nil {
-		return fmt.Errorf("desec: could not find zone for domain %q and fqdn %q : %w", domain, fqdn, err)
+		return fmt.Errorf("desec: get responsible domain: %w", err)
 	}
 
-	recordName := getRecordName(fqdn, authZone)
+	recordName, err := dns01.ExtractSubDomain(info.EffectiveFQDN, responsibleDomain.Name)
+	if err != nil {
+		return fmt.Errorf("desec: %w", err)
+	}
 
-	domainName := dns01.UnFqdn(authZone)
+	domainName := dns01.UnFqdn(responsibleDomain.Name)
 
-	rrSet, err := d.client.Records.Get(domainName, recordName, "TXT")
+	rrSet, err := d.client.Records.Get(ctx, domainName, recordName, "TXT")
 	if err != nil {
 		return fmt.Errorf("desec: failed to get records: domainName=%s, recordName=%s: %w", domainName, recordName, err)
 	}
 
 	records := make([]string, 0)
+
 	for _, record := range rrSet.Records {
-		if record != fmt.Sprintf(`"%s"`, value) {
+		if record != fmt.Sprintf(`%q`, info.Value) {
 			records = append(records, record)
 		}
 	}
 
-	_, err = d.client.Records.Update(domainName, recordName, "TXT", desec.RRSet{Records: records})
+	_, err = d.client.Records.Update(ctx, domainName, recordName, "TXT", desec.RRSet{Records: records})
 	if err != nil {
 		return fmt.Errorf("desec: failed to update records: domainName=%s, recordName=%s: %w", domainName, recordName, err)
 	}
 
 	return nil
-}
-
-func getRecordName(fqdn, authZone string) string {
-	return fqdn[0 : len(fqdn)-len(authZone)-1]
 }

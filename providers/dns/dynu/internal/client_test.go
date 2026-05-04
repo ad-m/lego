@@ -1,47 +1,27 @@
 package internal
 
 import (
-	"fmt"
-	"io"
 	"net/http"
 	"net/http/httptest"
-	"os"
+	"net/url"
 	"testing"
 
+	"github.com/go-acme/lego/v4/platform/tester/servermock"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-func setupTest(method, pattern string, status int, file string) *Client {
-	mux := http.NewServeMux()
-	server := httptest.NewServer(mux)
+func mockBuilder() *servermock.Builder[*Client] {
+	return servermock.NewBuilder[*Client](
+		func(server *httptest.Server) (*Client, error) {
+			client := NewClient()
+			client.HTTPClient = server.Client()
+			client.baseURL, _ = url.Parse(server.URL)
 
-	mux.HandleFunc(pattern, func(rw http.ResponseWriter, req *http.Request) {
-		if req.Method != method {
-			http.Error(rw, fmt.Sprintf("unsupported method %s", req.Method), http.StatusBadRequest)
-			return
-		}
-
-		open, err := os.Open(file)
-		if err != nil {
-			http.Error(rw, err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		defer func() { _ = open.Close() }()
-
-		rw.WriteHeader(status)
-		_, err = io.Copy(rw, open)
-		if err != nil {
-			http.Error(rw, err.Error(), http.StatusInternalServerError)
-			return
-		}
-	})
-
-	client := NewClient()
-	client.BaseURL = server.URL
-
-	return client
+			return client, nil
+		},
+		servermock.CheckHeader().WithJSONHeaders(),
+	)
 }
 
 func TestGetRootDomain(t *testing.T) {
@@ -59,9 +39,9 @@ func TestGetRootDomain(t *testing.T) {
 	}{
 		{
 			desc:    "success",
-			pattern: "/dns/getroot/test.lego.freeddns.org",
+			pattern: "GET /dns/getroot/test.lego.freeddns.org",
 			status:  http.StatusOK,
-			file:    "./fixtures/get_root_domain.json",
+			file:    "get_root_domain.json",
 			expected: expected{
 				domain: &DNSHostname{
 					APIException: &APIException{
@@ -76,9 +56,9 @@ func TestGetRootDomain(t *testing.T) {
 		},
 		{
 			desc:    "invalid",
-			pattern: "/dns/getroot/test.lego.freeddns.org",
+			pattern: "GET /dns/getroot/test.lego.freeddns.org",
 			status:  http.StatusNotImplemented,
-			file:    "./fixtures/get_root_domain_invalid.json",
+			file:    "get_root_domain_invalid.json",
 			expected: expected{
 				error: "API error: 501: Argument Exception: Invalid.",
 			},
@@ -86,13 +66,14 @@ func TestGetRootDomain(t *testing.T) {
 	}
 
 	for _, test := range testCases {
-		test := test
 		t.Run(test.desc, func(t *testing.T) {
 			t.Parallel()
 
-			client := setupTest(http.MethodGet, test.pattern, test.status, test.file)
+			client := mockBuilder().
+				Route(test.pattern, servermock.ResponseFromFixture(test.file).WithStatusCode(test.status)).
+				Build(t)
 
-			domain, err := client.GetRootDomain("test.lego.freeddns.org")
+			domain, err := client.GetRootDomain(t.Context(), "test.lego.freeddns.org")
 
 			if test.expected.error != "" {
 				assert.EqualError(t, err, test.expected.error)
@@ -122,9 +103,9 @@ func TestGetRecords(t *testing.T) {
 	}{
 		{
 			desc:    "success",
-			pattern: "/dns/record/_acme-challenge.lego.freeddns.org",
+			pattern: "GET /dns/record/_acme-challenge.lego.freeddns.org",
 			status:  http.StatusOK,
-			file:    "./fixtures/get_records.json",
+			file:    "get_records.json",
 			expected: expected{
 				records: []DNSRecord{
 					{
@@ -156,18 +137,18 @@ func TestGetRecords(t *testing.T) {
 		},
 		{
 			desc:    "empty",
-			pattern: "/dns/record/_acme-challenge.lego.freeddns.org",
+			pattern: "GET /dns/record/_acme-challenge.lego.freeddns.org",
 			status:  http.StatusOK,
-			file:    "./fixtures/get_records_empty.json",
+			file:    "get_records_empty.json",
 			expected: expected{
 				records: []DNSRecord{},
 			},
 		},
 		{
 			desc:    "invalid",
-			pattern: "/dns/record/_acme-challenge.lego.freeddns.org",
+			pattern: "GET /dns/record/_acme-challenge.lego.freeddns.org",
 			status:  http.StatusNotImplemented,
-			file:    "./fixtures/get_records_invalid.json",
+			file:    "get_records_invalid.json",
 			expected: expected{
 				error: "API error: 501: Argument Exception: Invalid.",
 			},
@@ -175,13 +156,16 @@ func TestGetRecords(t *testing.T) {
 	}
 
 	for _, test := range testCases {
-		test := test
 		t.Run(test.desc, func(t *testing.T) {
 			t.Parallel()
 
-			client := setupTest(http.MethodGet, test.pattern, test.status, test.file)
+			client := mockBuilder().
+				Route(test.pattern, servermock.ResponseFromFixture(test.file).WithStatusCode(test.status),
+					servermock.CheckQueryParameter().Strict().
+						With("recordType", "TXT")).
+				Build(t)
 
-			records, err := client.GetRecords("_acme-challenge.lego.freeddns.org", "TXT")
+			records, err := client.GetRecords(t.Context(), "_acme-challenge.lego.freeddns.org", "TXT")
 
 			if test.expected.error != "" {
 				assert.EqualError(t, err, test.expected.error)
@@ -210,15 +194,15 @@ func TestAddNewRecord(t *testing.T) {
 	}{
 		{
 			desc:    "success",
-			pattern: "/dns/9007481/record",
+			pattern: "POST /dns/9007481/record",
 			status:  http.StatusOK,
-			file:    "./fixtures/add_new_record.json",
+			file:    "add_new_record.json",
 		},
 		{
 			desc:    "invalid",
-			pattern: "/dns/9007481/record",
+			pattern: "POST /dns/9007481/record",
 			status:  http.StatusNotImplemented,
-			file:    "./fixtures/add_new_record_invalid.json",
+			file:    "add_new_record_invalid.json",
 			expected: expected{
 				error: "API error: 501: Argument Exception: Invalid.",
 			},
@@ -226,11 +210,13 @@ func TestAddNewRecord(t *testing.T) {
 	}
 
 	for _, test := range testCases {
-		test := test
 		t.Run(test.desc, func(t *testing.T) {
 			t.Parallel()
 
-			client := setupTest(http.MethodPost, test.pattern, test.status, test.file)
+			client := mockBuilder().
+				Route(test.pattern, servermock.ResponseFromFixture(test.file).WithStatusCode(test.status),
+					servermock.CheckRequestJSONBodyFromFixture("add_new_record-request.json")).
+				Build(t)
 
 			record := DNSRecord{
 				Type:       "TXT",
@@ -242,7 +228,7 @@ func TestAddNewRecord(t *testing.T) {
 				TTL:        300,
 			}
 
-			err := client.AddNewRecord(9007481, record)
+			err := client.AddNewRecord(t.Context(), 9007481, record)
 
 			if test.expected.error != "" {
 				assert.EqualError(t, err, test.expected.error)
@@ -268,15 +254,15 @@ func TestDeleteRecord(t *testing.T) {
 	}{
 		{
 			desc:    "success",
-			pattern: "/",
+			pattern: "DELETE /",
 			status:  http.StatusOK,
-			file:    "./fixtures/delete_record.json",
+			file:    "delete_record.json",
 		},
 		{
 			desc:    "invalid",
-			pattern: "/",
+			pattern: "DELETE /",
 			status:  http.StatusNotImplemented,
-			file:    "./fixtures/delete_record_invalid.json",
+			file:    "delete_record_invalid.json",
 			expected: expected{
 				error: "API error: 501: Argument Exception: Invalid.",
 			},
@@ -284,13 +270,14 @@ func TestDeleteRecord(t *testing.T) {
 	}
 
 	for _, test := range testCases {
-		test := test
 		t.Run(test.desc, func(t *testing.T) {
 			t.Parallel()
 
-			client := setupTest(http.MethodDelete, test.pattern, test.status, test.file)
+			client := mockBuilder().
+				Route(test.pattern, servermock.ResponseFromFixture(test.file).WithStatusCode(test.status)).
+				Build(t)
 
-			err := client.DeleteRecord(9007481, 6041418)
+			err := client.DeleteRecord(t.Context(), 9007481, 6041418)
 
 			if test.expected.error != "" {
 				assert.EqualError(t, err, test.expected.error)

@@ -29,7 +29,7 @@ func TestNewDNSProvider(t *testing.T) {
 				EnvAPIUsername: "api_username",
 				EnvAPIPassword: "api_password",
 			},
-			expected: `conoha: failed to create client: failed to login: HTTP request failed with status code 401: {"unauthorized":{"message":"Invalid user: api_username","code":401}}`,
+			expected: `conoha: failed to log in: unexpected status code: [status code: 401] body: {"unauthorized":{"message":"Invalid user: api_username","code":401}}`,
 		},
 		{
 			desc: "missing credentials",
@@ -72,6 +72,7 @@ func TestNewDNSProvider(t *testing.T) {
 	for _, test := range testCases {
 		t.Run(test.desc, func(t *testing.T) {
 			defer envTest.RestoreEnv()
+
 			envTest.ClearEnv()
 
 			envTest.Apply(test.envVars)
@@ -99,7 +100,7 @@ func TestNewDNSProviderConfig(t *testing.T) {
 	}{
 		{
 			desc:     "complete credentials, but login failed",
-			expected: `conoha: failed to create client: failed to login: HTTP request failed with status code 401: {"unauthorized":{"message":"Invalid user: api_username","code":401}}`,
+			expected: `conoha: failed to log in: unexpected status code: [status code: 401] body: {"unauthorized":{"message":"Invalid user: api_username","code":401}}`,
 			tenant:   "tenant_id",
 			username: "api_username",
 			password: "api_password",
@@ -155,6 +156,7 @@ func TestLivePresent(t *testing.T) {
 	}
 
 	envTest.RestoreEnv()
+
 	provider, err := NewDNSProvider()
 	require.NoError(t, err)
 
@@ -168,6 +170,7 @@ func TestLiveCleanUp(t *testing.T) {
 	}
 
 	envTest.RestoreEnv()
+
 	provider, err := NewDNSProvider()
 	require.NoError(t, err)
 

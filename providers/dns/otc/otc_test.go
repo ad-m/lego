@@ -2,138 +2,334 @@ package otc
 
 import (
 	"fmt"
-	"os"
+	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/go-acme/lego/v4/platform/tester"
-	"github.com/stretchr/testify/suite"
+	"github.com/go-acme/lego/v4/platform/tester/servermock"
+	"github.com/go-acme/lego/v4/providers/dns/otc/internal"
+	"github.com/stretchr/testify/require"
 )
 
-type OTCSuite struct {
-	suite.Suite
-	Mock    *DNSServerMock
-	envTest *tester.EnvTest
+const envDomain = envNamespace + "DOMAIN"
+
+var envTest = tester.NewEnvTest(
+	EnvDomainName,
+	EnvUserName,
+	EnvPassword,
+	EnvPrivateZone,
+	EnvProjectName,
+	EnvIdentityEndpoint).
+	WithDomain(envDomain)
+
+func TestNewDNSProvider(t *testing.T) {
+	testCases := []struct {
+		desc     string
+		envVars  map[string]string
+		expected string
+	}{
+		{
+			desc: "success",
+			envVars: map[string]string{
+				EnvDomainName:  "example.com",
+				EnvUserName:    "user",
+				EnvPassword:    "secret",
+				EnvProjectName: "test",
+			},
+		},
+		{
+			desc: "missing credentials",
+			envVars: map[string]string{
+				EnvDomainName:  "",
+				EnvUserName:    "",
+				EnvPassword:    "",
+				EnvProjectName: "",
+			},
+			expected: "otc: some credentials information are missing: OTC_DOMAIN_NAME,OTC_USER_NAME,OTC_PASSWORD,OTC_PROJECT_NAME",
+		},
+		{
+			desc: "missing domain name",
+			envVars: map[string]string{
+				EnvDomainName:  "",
+				EnvUserName:    "user",
+				EnvPassword:    "secret",
+				EnvProjectName: "test",
+			},
+			expected: "otc: some credentials information are missing: OTC_DOMAIN_NAME",
+		},
+		{
+			desc: "missing username",
+			envVars: map[string]string{
+				EnvDomainName:  "example.com",
+				EnvUserName:    "",
+				EnvPassword:    "secret",
+				EnvProjectName: "test",
+			},
+			expected: "otc: some credentials information are missing: OTC_USER_NAME",
+		},
+		{
+			desc: "missing password",
+			envVars: map[string]string{
+				EnvDomainName:  "example.com",
+				EnvUserName:    "user",
+				EnvPassword:    "",
+				EnvProjectName: "test",
+			},
+			expected: "otc: some credentials information are missing: OTC_PASSWORD",
+		},
+		{
+			desc: "missing project name",
+			envVars: map[string]string{
+				EnvDomainName:  "example.com",
+				EnvUserName:    "user",
+				EnvPassword:    "secret",
+				EnvProjectName: "",
+			},
+			expected: "otc: some credentials information are missing: OTC_PROJECT_NAME",
+		},
+	}
+
+	for _, test := range testCases {
+		t.Run(test.desc, func(t *testing.T) {
+			defer envTest.RestoreEnv()
+
+			envTest.ClearEnv()
+
+			envTest.Apply(test.envVars)
+
+			p, err := NewDNSProvider()
+
+			if test.expected == "" {
+				require.NoError(t, err)
+				require.NotNil(t, p)
+				require.NotNil(t, p.config)
+			} else {
+				require.EqualError(t, err, test.expected)
+			}
+		})
+	}
 }
 
-func (s *OTCSuite) SetupTest() {
-	s.Mock = NewDNSServerMock(s.T())
-	s.Mock.HandleAuthSuccessfully()
-	s.envTest = tester.NewEnvTest(
-		EnvDomainName,
-		EnvUserName,
-		EnvPassword,
-		EnvProjectName,
-		EnvIdentityEndpoint,
-	)
+func TestNewDNSProviderConfig(t *testing.T) {
+	testCases := []struct {
+		desc        string
+		domainName  string
+		projectName string
+		username    string
+		password    string
+		expected    string
+	}{
+		{
+			desc:        "success",
+			domainName:  "example.com",
+			projectName: "test",
+			username:    "user",
+			password:    "secret",
+		},
+		{
+			desc:     "missing credentials",
+			expected: "otc: credentials missing",
+		},
+		{
+			desc:        "missing domain name",
+			domainName:  "",
+			projectName: "test",
+			username:    "user",
+			password:    "secret",
+			expected:    "otc: credentials missing",
+		},
+		{
+			desc:        "missing project name",
+			domainName:  "example.com",
+			projectName: "",
+			username:    "user",
+			password:    "secret",
+			expected:    "otc: credentials missing",
+		},
+		{
+			desc:        "missing username",
+			domainName:  "example.com",
+			projectName: "test",
+			username:    "",
+			password:    "secret",
+			expected:    "otc: credentials missing",
+		},
+		{
+			desc:        "missing password ",
+			domainName:  "example.com",
+			projectName: "test",
+			username:    "user",
+			password:    "",
+			expected:    "otc: credentials missing",
+		},
+	}
+
+	for _, test := range testCases {
+		t.Run(test.desc, func(t *testing.T) {
+			config := NewDefaultConfig()
+			config.DomainName = test.domainName
+			config.ProjectName = test.projectName
+			config.UserName = test.username
+			config.Password = test.password
+
+			p, err := NewDNSProviderConfig(config)
+
+			if test.expected == "" {
+				require.NoError(t, err)
+				require.NotNil(t, p)
+				require.NotNil(t, p.config)
+			} else {
+				require.EqualError(t, err, test.expected)
+			}
+		})
+	}
 }
 
-func (s *OTCSuite) TearDownTest() {
-	s.envTest.RestoreEnv()
-	s.Mock.ShutdownServer()
-}
+func TestLivePresent(t *testing.T) {
+	if !envTest.IsLiveTest() {
+		t.Skip("skipping live test")
+	}
 
-func TestTestSuite(t *testing.T) {
-	suite.Run(t, new(OTCSuite))
-}
-
-func (s *OTCSuite) createDNSProvider() (*DNSProvider, error) {
-	config := NewDefaultConfig()
-	config.UserName = "UserName"
-	config.Password = "Password"
-	config.DomainName = "DomainName"
-	config.ProjectName = "ProjectName"
-	config.IdentityEndpoint = fmt.Sprintf("%s/v3/auth/token", s.Mock.GetServerURL())
-
-	return NewDNSProviderConfig(config)
-}
-
-func (s *OTCSuite) TestLogin() {
-	provider, err := s.createDNSProvider()
-	s.Require().NoError(err)
-
-	err = provider.loginRequest()
-	s.Require().NoError(err)
-
-	s.Equal(provider.baseURL, fmt.Sprintf("%s/v2", s.Mock.GetServerURL()))
-	s.Equal(fakeOTCToken, provider.token)
-}
-
-func (s *OTCSuite) TestLoginEnv() {
-	s.envTest.ClearEnv()
-
-	s.envTest.Apply(map[string]string{
-		EnvDomainName:       "unittest1",
-		EnvUserName:         "unittest2",
-		EnvPassword:         "unittest3",
-		EnvProjectName:      "unittest4",
-		EnvIdentityEndpoint: "unittest5",
-	})
+	envTest.RestoreEnv()
 
 	provider, err := NewDNSProvider()
-	s.Require().NoError(err)
+	require.NoError(t, err)
 
-	s.Equal(provider.config.DomainName, "unittest1")
-	s.Equal(provider.config.UserName, "unittest2")
-	s.Equal(provider.config.Password, "unittest3")
-	s.Equal(provider.config.ProjectName, "unittest4")
-	s.Equal(provider.config.IdentityEndpoint, "unittest5")
-
-	os.Setenv(EnvIdentityEndpoint, "")
-
-	provider, err = NewDNSProvider()
-	s.Require().NoError(err)
-
-	s.Equal(provider.config.IdentityEndpoint, "https://iam.eu-de.otc.t-systems.com:443/v3/auth/tokens")
+	err = provider.Present(envTest.GetDomain(), "", "123d==")
+	require.NoError(t, err)
 }
 
-func (s *OTCSuite) TestLoginEnvEmpty() {
-	s.envTest.ClearEnv()
+func TestLiveCleanUp(t *testing.T) {
+	if !envTest.IsLiveTest() {
+		t.Skip("skipping live test")
+	}
 
-	_, err := NewDNSProvider()
-	s.EqualError(err, "otc: some credentials information are missing: OTC_DOMAIN_NAME,OTC_USER_NAME,OTC_PASSWORD,OTC_PROJECT_NAME")
+	envTest.RestoreEnv()
+
+	provider, err := NewDNSProvider()
+	require.NoError(t, err)
+
+	time.Sleep(1 * time.Second)
+
+	err = provider.CleanUp(envTest.GetDomain(), "", "123d==")
+	require.NoError(t, err)
 }
 
-func (s *OTCSuite) TestDNSProvider_Present() {
-	s.Mock.HandleListZonesSuccessfully()
-	s.Mock.HandleListRecordsetsSuccessfully()
+func TestDNSProvider_Present(t *testing.T) {
+	provider := mockBuilder(false).
+		Route("GET /v2/zones",
+			servermock.ResponseFromInternal("zones_GET.json"),
+			servermock.CheckQueryParameter().Strict().
+				With("name", "example.com.")).
+		Route("POST /v2/zones/123123/recordsets",
+			servermock.Noop(),
+			servermock.CheckRequestJSONBodyFromInternal("zones-recordsets_POST-request.json")).
+		Build(t)
 
-	provider, err := s.createDNSProvider()
-	s.Require().NoError(err)
-
-	err = provider.Present("example.com", "", "foobar")
-	s.Require().NoError(err)
+	err := provider.Present("example.com", "", "123d==")
+	require.NoError(t, err)
 }
 
-func (s *OTCSuite) TestDNSProvider_Present_EmptyZone() {
-	s.Mock.HandleListZonesEmpty()
-	s.Mock.HandleListRecordsetsSuccessfully()
+func TestDNSProvider_Present_private(t *testing.T) {
+	provider := mockBuilder(true).
+		Route("GET /v2/zones",
+			servermock.ResponseFromInternal("zones_GET.json"),
+			servermock.CheckQueryParameter().Strict().
+				With("name", "example.com.").
+				With("type", "private")).
+		Route("POST /v2/zones/123123/recordsets",
+			servermock.Noop(),
+			servermock.CheckRequestJSONBodyFromInternal("zones-recordsets_POST-request.json")).
+		Build(t)
 
-	provider, err := s.createDNSProvider()
-	s.Require().NoError(err)
-
-	err = provider.Present("example.com", "", "foobar")
-	s.NotNil(err)
+	err := provider.Present("example.com", "", "123d==")
+	require.NoError(t, err)
 }
 
-func (s *OTCSuite) TestDNSProvider_CleanUp() {
-	s.Mock.HandleListZonesSuccessfully()
-	s.Mock.HandleListRecordsetsSuccessfully()
-	s.Mock.HandleDeleteRecordsetsSuccessfully()
+func TestDNSProvider_Present_emptyZone(t *testing.T) {
+	provider := mockBuilder(false).
+		Route("GET /v2/zones",
+			servermock.ResponseFromInternal("zones_GET_empty.json"),
+			servermock.CheckQueryParameter().Strict().
+				With("name", "example.com.")).
+		Build(t)
 
-	provider, err := s.createDNSProvider()
-	s.Require().NoError(err)
-
-	err = provider.CleanUp("example.com", "", "foobar")
-	s.Require().NoError(err)
+	err := provider.Present("example.com", "", "123d==")
+	require.EqualError(t, err, "otc: unable to get zone: zone example.com. not found")
 }
 
-func (s *OTCSuite) TestDNSProvider_CleanUp_EmptyRecordset() {
-	s.Mock.HandleListZonesSuccessfully()
-	s.Mock.HandleListRecordsetsEmpty()
+func TestDNSProvider_Cleanup(t *testing.T) {
+	provider := mockBuilder(false).
+		Route("GET /v2/zones",
+			servermock.ResponseFromInternal("zones_GET.json"),
+			servermock.CheckQueryParameter().Strict().
+				With("name", "example.com.")).
+		Route("GET /v2/zones/123123/recordsets",
+			servermock.ResponseFromInternal("zones-recordsets_GET.json"),
+			servermock.CheckQueryParameter().Strict().
+				With("name", "_acme-challenge.example.com.").
+				With("type", "TXT")).
+		Route("DELETE /v2/zones/123123/recordsets/321321",
+			servermock.ResponseFromInternal("zones-recordsets_DELETE.json")).
+		Build(t)
 
-	provider, err := s.createDNSProvider()
-	s.Require().NoError(err)
+	err := provider.CleanUp("example.com", "", "123d==")
+	require.NoError(t, err)
+}
 
-	err = provider.CleanUp("example.com", "", "foobar")
-	s.Require().Error(err)
+func TestDNSProvider_Cleanup_private(t *testing.T) {
+	provider := mockBuilder(true).
+		Route("GET /v2/zones",
+			servermock.ResponseFromInternal("zones_GET.json"),
+			servermock.CheckQueryParameter().Strict().
+				With("name", "example.com.").
+				With("type", "private")).
+		Route("GET /v2/zones/123123/recordsets",
+			servermock.ResponseFromInternal("zones-recordsets_GET.json"),
+			servermock.CheckQueryParameter().Strict().
+				With("name", "_acme-challenge.example.com.").
+				With("type", "TXT")).
+		Route("DELETE /v2/zones/123123/recordsets/321321",
+			servermock.ResponseFromInternal("zones-recordsets_DELETE.json")).
+		Build(t)
+
+	err := provider.CleanUp("example.com", "", "123d==")
+	require.NoError(t, err)
+}
+
+func TestDNSProvider_Cleanup_emptyRecordset(t *testing.T) {
+	provider := mockBuilder(false).
+		Route("GET /v2/zones",
+			servermock.ResponseFromInternal("zones_GET.json"),
+			servermock.CheckQueryParameter().Strict().
+				With("name", "example.com.")).
+		Route("GET /v2/zones/123123/recordsets",
+			servermock.ResponseFromInternal("zones-recordsets_GET_empty.json"),
+			servermock.CheckQueryParameter().Strict().
+				With("name", "_acme-challenge.example.com.").
+				With("type", "TXT")).
+		Build(t)
+
+	err := provider.CleanUp("example.com", "", "123d==")
+	require.EqualError(t, err, "otc: unable to get record _acme-challenge.example.com. for zone example.com: record not found")
+}
+
+func mockBuilder(private bool) *servermock.Builder[*DNSProvider] {
+	return servermock.NewBuilder(
+		func(server *httptest.Server) (*DNSProvider, error) {
+			config := NewDefaultConfig()
+			config.HTTPClient = server.Client()
+			config.UserName = "user"
+			config.Password = "secret"
+			config.DomainName = "example.com"
+			config.ProjectName = "test"
+			config.IdentityEndpoint = fmt.Sprintf("%s/v3/auth/token", server.URL)
+			config.PrivateZone = private
+
+			return NewDNSProviderConfig(config)
+		},
+		servermock.CheckHeader().WithJSONHeaders(),
+	).
+		Route("POST /v3/auth/token", internal.IdentityHandlerMock())
 }

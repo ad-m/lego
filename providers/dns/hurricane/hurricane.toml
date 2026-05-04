@@ -6,10 +6,10 @@ Since = "v4.3.0"
 
 Example = '''
 HURRICANE_TOKENS=example.org:token \
-lego --email myemail@example.com --dns hurricane -d example.org -d *.example.org run
+lego --dns hurricane -d '*.example.com' -d example.com run
 
 HURRICANE_TOKENS=my.example.org:token1,demo.example.org:token2 \
-lego -m myemail@example.com --dns hurricane -d my.example.org -d demo.example.org
+lego --dns hurricane -d my.example.org -d demo.example.org
 '''
 
 Additional = """
@@ -36,13 +36,13 @@ HURRICANE_TOKENS=example.org:token
 """
 
 [Configuration]
-
   [Configuration.Credentials]
     HURRICANE_TOKENS = "TXT record names and tokens"
-  [Configuration.Addtional]
-    HURRICANE_POLLING_INTERVAL = "Time between DNS propagation checks"
-    HURRICANE_PROPAGATION_TIMEOUT = "Maximum waiting time for DNS propagation; defaults to 300s (5 minutes)"
-    
+  [Configuration.Additional]
+    HURRICANE_POLLING_INTERVAL = "Time between DNS propagation check in seconds (Default: 2)"
+    HURRICANE_PROPAGATION_TIMEOUT = "Maximum waiting time for DNS propagation (Default: 300)"
+    HURRICANE_SEQUENCE_INTERVAL = "Time between sequential requests in seconds (Default: 60)"
+    HURRICANE_HTTP_TIMEOUT = "API request timeout in seconds (Default: 30)"
 
 [Links]
-  API = "https://dns.he.org/"
+  API = "https://dns.he.net/"

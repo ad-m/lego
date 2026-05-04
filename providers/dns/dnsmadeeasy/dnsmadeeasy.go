@@ -2,16 +2,20 @@
 package dnsmadeeasy
 
 import (
+	"context"
 	"crypto/tls"
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
+	"github.com/go-acme/lego/v4/challenge"
 	"github.com/go-acme/lego/v4/challenge/dns01"
 	"github.com/go-acme/lego/v4/platform/config/env"
 	"github.com/go-acme/lego/v4/providers/dns/dnsmadeeasy/internal"
+	"github.com/go-acme/lego/v4/providers/dns/internal/clientdebug"
 )
 
 // Environment variables names.
@@ -28,6 +32,8 @@ const (
 	EnvHTTPTimeout        = envNamespace + "HTTP_TIMEOUT"
 )
 
+var _ challenge.ProviderTimeout = (*DNSProvider)(nil)
+
 // Config is used to configure the creation of the DNSProvider.
 type Config struct {
 	BaseURL            string
@@ -42,15 +48,22 @@ type Config struct {
 
 // NewDefaultConfig returns a default configuration for the DNSProvider.
 func NewDefaultConfig() *Config {
+	tr := &http.Transport{}
+
+	defaultTransport, ok := http.DefaultTransport.(*http.Transport)
+	if ok {
+		tr = defaultTransport.Clone()
+	}
+
+	tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+
 	return &Config{
 		TTL:                env.GetOrDefaultInt(EnvTTL, dns01.DefaultTTL),
 		PropagationTimeout: env.GetOrDefaultSecond(EnvPropagationTimeout, dns01.DefaultPropagationTimeout),
 		PollingInterval:    env.GetOrDefaultSecond(EnvPollingInterval, dns01.DefaultPollingInterval),
 		HTTPClient: &http.Client{
-			Timeout: env.GetOrDefaultSecond(EnvHTTPTimeout, 10*time.Second),
-			Transport: &http.Transport{
-				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-			},
+			Timeout:   env.GetOrDefaultSecond(EnvHTTPTimeout, 10*time.Second),
+			Transport: tr,
 		},
 	}
 }
@@ -86,12 +99,12 @@ func NewDNSProviderConfig(config *Config) (*DNSProvider, error) {
 
 	var baseURL string
 	if config.Sandbox {
-		baseURL = "https://api.sandbox.dnsmadeeasy.com/V2.0"
+		baseURL = internal.DefaultSandboxBaseURL
 	} else {
-		if len(config.BaseURL) > 0 {
-			baseURL = config.BaseURL
+		if config.BaseURL == "" {
+			baseURL = internal.DefaultProdBaseURL
 		} else {
-			baseURL = "https://api.dnsmadeeasy.com/V2.0"
+			baseURL = config.BaseURL
 		}
 	}
 
@@ -100,8 +113,16 @@ func NewDNSProviderConfig(config *Config) (*DNSProvider, error) {
 		return nil, fmt.Errorf("dnsmadeeasy: %w", err)
 	}
 
-	client.HTTPClient = config.HTTPClient
-	client.BaseURL = baseURL
+	if config.HTTPClient != nil {
+		client.HTTPClient = config.HTTPClient
+	}
+
+	client.HTTPClient = clientdebug.Wrap(client.HTTPClient)
+
+	client.BaseURL, err = url.Parse(baseURL)
+	if err != nil {
+		return nil, err
+	}
 
 	return &DNSProvider{
 		client: client,
@@ -111,56 +132,63 @@ func NewDNSProviderConfig(config *Config) (*DNSProvider, error) {
 
 // Present creates a TXT record using the specified parameters.
 func (d *DNSProvider) Present(domainName, token, keyAuth string) error {
-	fqdn, value := dns01.GetRecord(domainName, keyAuth)
+	info := dns01.GetChallengeInfo(domainName, keyAuth)
 
-	authZone, err := dns01.FindZoneByFqdn(fqdn)
+	authZone, err := dns01.FindZoneByFqdn(info.EffectiveFQDN)
 	if err != nil {
-		return fmt.Errorf("dnsmadeeasy: unable to find zone for %s: %w", fqdn, err)
+		return fmt.Errorf("dnsmadeeasy: could not find zone for domain %q: %w", domainName, err)
 	}
 
+	ctx := context.Background()
+
 	// fetch the domain details
-	domain, err := d.client.GetDomain(authZone)
+	domain, err := d.client.GetDomain(ctx, authZone)
 	if err != nil {
 		return fmt.Errorf("dnsmadeeasy: unable to get domain for zone %s: %w", authZone, err)
 	}
 
 	// create the TXT record
-	name := strings.Replace(fqdn, "."+authZone, "", 1)
-	record := &internal.Record{Type: "TXT", Name: name, Value: value, TTL: d.config.TTL}
+	name := strings.Replace(info.EffectiveFQDN, "."+authZone, "", 1)
+	record := &internal.Record{Type: "TXT", Name: name, Value: info.Value, TTL: d.config.TTL}
 
-	err = d.client.CreateRecord(domain, record)
+	err = d.client.CreateRecord(ctx, domain, record)
 	if err != nil {
 		return fmt.Errorf("dnsmadeeasy: unable to create record for %s: %w", name, err)
 	}
+
 	return nil
 }
 
 // CleanUp removes the TXT records matching the specified parameters.
 func (d *DNSProvider) CleanUp(domainName, token, keyAuth string) error {
-	fqdn, _ := dns01.GetRecord(domainName, keyAuth)
+	info := dns01.GetChallengeInfo(domainName, keyAuth)
 
-	authZone, err := dns01.FindZoneByFqdn(fqdn)
+	authZone, err := dns01.FindZoneByFqdn(info.EffectiveFQDN)
 	if err != nil {
-		return fmt.Errorf("dnsmadeeasy: unable to find zone for %s: %w", fqdn, err)
+		return fmt.Errorf("dnsmadeeasy: could not find zone for domain %q: %w", domainName, err)
 	}
 
+	ctx := context.Background()
+
 	// fetch the domain details
-	domain, err := d.client.GetDomain(authZone)
+	domain, err := d.client.GetDomain(ctx, authZone)
 	if err != nil {
 		return fmt.Errorf("dnsmadeeasy: unable to get domain for zone %s: %w", authZone, err)
 	}
 
 	// find matching records
-	name := strings.Replace(fqdn, "."+authZone, "", 1)
-	records, err := d.client.GetRecords(domain, name, "TXT")
+	name := strings.Replace(info.EffectiveFQDN, "."+authZone, "", 1)
+
+	records, err := d.client.GetRecords(ctx, domain, name, "TXT")
 	if err != nil {
 		return fmt.Errorf("dnsmadeeasy: unable to get records for domain %s: %w", domain.Name, err)
 	}
 
 	// delete records
 	var lastError error
+
 	for _, record := range *records {
-		err = d.client.DeleteRecord(record)
+		err = d.client.DeleteRecord(ctx, record)
 		if err != nil {
 			lastError = fmt.Errorf("dnsmadeeasy: unable to delete record [id=%d, name=%s]: %w", record.ID, record.Name, err)
 		}

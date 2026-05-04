@@ -1,7 +1,6 @@
 package env
 
 import (
-	"io/ioutil"
 	"os"
 	"testing"
 	"time"
@@ -16,12 +15,12 @@ func TestGetWithFallback(t *testing.T) {
 	var1Missing := os.Getenv("TEST_LEGO_VAR_MISSING_1")
 	var2Missing := os.Getenv("TEST_LEGO_VAR_MISSING_2")
 
-	defer func() {
+	t.Cleanup(func() {
 		_ = os.Setenv("TEST_LEGO_VAR_EXIST_1", var1Exist)
 		_ = os.Setenv("TEST_LEGO_VAR_EXIST_2", var2Exist)
 		_ = os.Setenv("TEST_LEGO_VAR_MISSING_1", var1Missing)
 		_ = os.Setenv("TEST_LEGO_VAR_MISSING_2", var2Missing)
-	}()
+	})
 
 	err := os.Setenv("TEST_LEGO_VAR_EXIST_1", "VAR1")
 	require.NoError(t, err)
@@ -95,13 +94,82 @@ func TestGetWithFallback(t *testing.T) {
 
 	for _, test := range testCases {
 		t.Run(test.desc, func(t *testing.T) {
+			t.Parallel()
+
 			value, err := GetWithFallback(test.groups...)
-			if len(test.expected.error) > 0 {
+			if test.expected.error != "" {
 				assert.EqualError(t, err, test.expected.error)
 			} else {
 				require.NoError(t, err)
 				assert.Equal(t, test.expected.value, value)
 			}
+		})
+	}
+}
+
+func TestGetOneWithFallback(t *testing.T) {
+	var1Exist := os.Getenv("TEST_LEGO_VAR_EXIST_1")
+	var2Exist := os.Getenv("TEST_LEGO_VAR_EXIST_2")
+	var1Missing := os.Getenv("TEST_LEGO_VAR_MISSING_1")
+	var2Missing := os.Getenv("TEST_LEGO_VAR_MISSING_2")
+
+	t.Cleanup(func() {
+		_ = os.Setenv("TEST_LEGO_VAR_EXIST_1", var1Exist)
+		_ = os.Setenv("TEST_LEGO_VAR_EXIST_2", var2Exist)
+		_ = os.Setenv("TEST_LEGO_VAR_MISSING_1", var1Missing)
+		_ = os.Setenv("TEST_LEGO_VAR_MISSING_2", var2Missing)
+	})
+
+	err := os.Setenv("TEST_LEGO_VAR_EXIST_1", "VAR1")
+	require.NoError(t, err)
+	err = os.Setenv("TEST_LEGO_VAR_EXIST_2", "VAR2")
+	require.NoError(t, err)
+	err = os.Unsetenv("TEST_LEGO_VAR_MISSING_1")
+	require.NoError(t, err)
+	err = os.Unsetenv("TEST_LEGO_VAR_MISSING_2")
+	require.NoError(t, err)
+
+	testCases := []struct {
+		desc         string
+		main         string
+		defaultValue string
+		alts         []string
+		expected     string
+	}{
+		{
+			desc:         "with value and no alternative",
+			main:         "TEST_LEGO_VAR_EXIST_1",
+			defaultValue: "oops",
+			expected:     "VAR1",
+		},
+		{
+			desc:         "with value and alternatives",
+			main:         "TEST_LEGO_VAR_EXIST_1",
+			defaultValue: "oops",
+			alts:         []string{"TEST_LEGO_VAR_MISSING_1"},
+			expected:     "VAR1",
+		},
+		{
+			desc:         "without value and no alternatives",
+			main:         "TEST_LEGO_VAR_MISSING_1",
+			defaultValue: "oops",
+			expected:     "oops",
+		},
+		{
+			desc:         "without value and alternatives",
+			main:         "TEST_LEGO_VAR_MISSING_1",
+			defaultValue: "oops",
+			alts:         []string{"TEST_LEGO_VAR_EXIST_1"},
+			expected:     "VAR1",
+		},
+	}
+
+	for _, test := range testCases {
+		t.Run(test.desc, func(t *testing.T) {
+			t.Parallel()
+
+			value := GetOneWithFallback(test.main, test.defaultValue, ParseString, test.alts...)
+			assert.Equal(t, test.expected, value)
 		})
 	}
 }
@@ -143,9 +211,7 @@ func TestGetOrDefaultInt(t *testing.T) {
 
 	for _, test := range testCases {
 		t.Run(test.desc, func(t *testing.T) {
-			defer os.Unsetenv(key)
-			err := os.Setenv(key, test.envValue)
-			require.NoError(t, err)
+			t.Setenv(key, test.envValue)
 
 			result := GetOrDefaultInt(key, test.defaultValue)
 			assert.Equal(t, test.expected, result)
@@ -190,9 +256,7 @@ func TestGetOrDefaultSecond(t *testing.T) {
 
 	for _, test := range testCases {
 		t.Run(test.desc, func(t *testing.T) {
-			defer os.Unsetenv(key)
-			err := os.Setenv(key, test.envValue)
-			require.NoError(t, err)
+			t.Setenv(key, test.envValue)
 
 			result := GetOrDefaultSecond(key, test.defaultValue)
 			assert.Equal(t, test.expected, result)
@@ -224,9 +288,7 @@ func TestGetOrDefaultString(t *testing.T) {
 
 	for _, test := range testCases {
 		t.Run(test.desc, func(t *testing.T) {
-			defer os.Unsetenv(key)
-			err := os.Setenv(key, test.envValue)
-			require.NoError(t, err)
+			t.Setenv(key, test.envValue)
 
 			actual := GetOrDefaultString(key, test.defaultValue)
 			assert.Equal(t, test.expected, actual)
@@ -264,9 +326,7 @@ func TestGetOrDefaultBool(t *testing.T) {
 
 	for _, test := range testCases {
 		t.Run(test.desc, func(t *testing.T) {
-			defer os.Unsetenv(key)
-			err := os.Setenv(key, test.envValue)
-			require.NoError(t, err)
+			t.Setenv(key, test.envValue)
 
 			actual := GetOrDefaultBool(key, test.defaultValue)
 			assert.Equal(t, test.expected, actual)
@@ -275,9 +335,7 @@ func TestGetOrDefaultBool(t *testing.T) {
 }
 
 func TestGetOrFile_ReadsEnvVars(t *testing.T) {
-	err := os.Setenv("TEST_LEGO_ENV_VAR", "lego_env")
-	require.NoError(t, err)
-	defer os.Unsetenv("TEST_LEGO_ENV_VAR")
+	t.Setenv("TEST_LEGO_ENV_VAR", "lego_env")
 
 	value := GetOrFile("TEST_LEGO_ENV_VAR")
 
@@ -309,16 +367,15 @@ func TestGetOrFile_ReadsFiles(t *testing.T) {
 			err = os.Unsetenv(varEnvName)
 			require.NoError(t, err)
 
-			file, err := ioutil.TempFile("", "lego")
-			require.NoError(t, err)
-			defer os.Remove(file.Name())
-
-			err = ioutil.WriteFile(file.Name(), []byte("lego_file\n"), 0o644)
+			file, err := os.CreateTemp(t.TempDir(), "lego")
 			require.NoError(t, err)
 
-			err = os.Setenv(varEnvFileName, file.Name())
+			t.Cleanup(func() { _ = file.Close() })
+
+			err = os.WriteFile(file.Name(), []byte("lego_file\n"), 0o644)
 			require.NoError(t, err)
-			defer os.Unsetenv(varEnvFileName)
+
+			t.Setenv(varEnvFileName, file.Name())
 
 			value := GetOrFile(varEnvName)
 
@@ -336,22 +393,92 @@ func TestGetOrFile_PrefersEnvVars(t *testing.T) {
 	err = os.Unsetenv(varEnvName)
 	require.NoError(t, err)
 
-	file, err := ioutil.TempFile("", "lego")
-	require.NoError(t, err)
-	defer os.Remove(file.Name())
-
-	err = ioutil.WriteFile(file.Name(), []byte("lego_file"), 0o644)
+	file, err := os.CreateTemp(t.TempDir(), "lego")
 	require.NoError(t, err)
 
-	err = os.Setenv(varEnvFileName, file.Name())
-	require.NoError(t, err)
-	defer os.Unsetenv(varEnvFileName)
+	t.Cleanup(func() { _ = file.Close() })
 
-	err = os.Setenv(varEnvName, "lego_env")
+	err = os.WriteFile(file.Name(), []byte("lego_file"), 0o644)
 	require.NoError(t, err)
-	defer os.Unsetenv(varEnvName)
+
+	t.Setenv(varEnvFileName, file.Name())
+	t.Setenv(varEnvName, "lego_env")
 
 	value := GetOrFile(varEnvName)
 
 	assert.Equal(t, "lego_env", value)
+}
+
+func TestParsePairs(t *testing.T) {
+	testCases := []struct {
+		desc     string
+		value    string
+		expected map[string]string
+	}{
+		{
+			desc:     "one pair",
+			value:    "foo:bar",
+			expected: map[string]string{"foo": "bar"},
+		},
+		{
+			desc:     "multiple pairs",
+			value:    "foo:bar,a:b,c:d",
+			expected: map[string]string{"a": "b", "c": "d", "foo": "bar"},
+		},
+		{
+			desc:     "multiple pairs with spaces",
+			value:    "foo:bar, a:b , c: d",
+			expected: map[string]string{"a": "b", "c": "d", "foo": "bar"},
+		},
+		{
+			desc:     "empty value pair",
+			value:    "foo:",
+			expected: map[string]string{"foo": ""},
+		},
+		{
+			desc:     "empty key pair",
+			value:    ":bar",
+			expected: map[string]string{"": "bar"},
+		},
+	}
+
+	for _, test := range testCases {
+		t.Run(test.desc, func(t *testing.T) {
+			t.Parallel()
+
+			pairs, err := ParsePairs(test.value)
+			require.NoError(t, err)
+
+			assert.Equal(t, test.expected, pairs)
+		})
+	}
+}
+
+func TestParsePairs_error(t *testing.T) {
+	testCases := []struct {
+		desc  string
+		value string
+	}{
+		{
+			desc:  "empty value",
+			value: "",
+		},
+		{
+			desc:  "multiple colons",
+			value: "foo:bar:bir",
+		},
+		{
+			desc:  "valid pair and multiple colons",
+			value: "a:b,foo:bar:bir",
+		},
+	}
+
+	for _, test := range testCases {
+		t.Run(test.desc, func(t *testing.T) {
+			t.Parallel()
+
+			_, err := ParsePairs(test.value)
+			require.Error(t, err)
+		})
+	}
 }

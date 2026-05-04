@@ -20,14 +20,11 @@ clean:
 
 build: clean
 	@echo Version: $(VERSION)
-	go build -v -trimpath -ldflags '-X "main.version=${VERSION}"' -o ${BIN_OUTPUT} ${MAIN_DIRECTORY}
+	go build -trimpath -ldflags '-X "main.version=${VERSION}"' -o ${BIN_OUTPUT} ${MAIN_DIRECTORY}
 
 image:
 	@echo Version: $(VERSION)
 	docker build -t $(LEGO_IMAGE) .
-
-publish-images:
-	seihon publish -v "$(TAG_NAME)" -v "latest" --image-name="$(LEGO_IMAGE)" --dry-run=false
 
 test: clean
 	go test -v -cover ./...
@@ -42,25 +39,25 @@ checks:
 .PHONY: patch minor major detach
 
 patch:
-	go run internal/release.go release -m patch
+	go run ./internal/releaser/ release -m patch
 
 minor:
-	go run internal/release.go release -m minor
+	go run ./internal/releaser/ release -m minor
 
 major:
-	go run internal/release.go release -m major
+	go run ./internal/releaser/ release -m major
 
 detach:
-	go run internal/release.go detach
+	go run ./internal/releaser/ detach
 
 # Docs
 .PHONY: docs-build docs-serve docs-themes
 
 docs-build: generate-dns
-	@make -C ./docs hugo-build
+	@make -C ./docs build
 
 docs-serve: generate-dns
-	@make -C ./docs hugo
+	@make -C ./docs serve
 
 docs-themes:
 	@make -C ./docs hugo-themes
@@ -74,7 +71,7 @@ generate-dns:
 validate-doc: generate-dns
 validate-doc: DOC_DIRECTORIES := ./docs/ ./cmd/
 validate-doc:
-	if git diff --exit-code --quiet $(DOC_DIRECTORIES) 2>/dev/null; then \
+	@if git diff --exit-code --quiet $(DOC_DIRECTORIES) 2>/dev/null; then \
 		echo 'All documentation changes are done the right way.'; \
 	else \
 		echo 'The documentation must be regenerated, please use `make generate-dns`.'; \

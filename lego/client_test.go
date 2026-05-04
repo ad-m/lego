@@ -13,11 +13,9 @@ import (
 )
 
 func TestNewClient(t *testing.T) {
-	_, apiURL, tearDown := tester.SetupFakeAPI()
-	defer tearDown()
+	server := tester.MockACMEServer().BuildHTTPS(t)
 
-	keyBits := 32 // small value keeps test fast
-	key, err := rsa.GenerateKey(rand.Reader, keyBits)
+	key, err := rsa.GenerateKey(rand.Reader, 1024)
 	require.NoError(t, err, "Could not generate test key")
 
 	user := mockUser{
@@ -27,7 +25,8 @@ func TestNewClient(t *testing.T) {
 	}
 
 	config := NewConfig(user)
-	config.CADirURL = apiURL + "/dir"
+	config.CADirURL = server.URL + "/dir"
+	config.HTTPClient = server.Client()
 
 	client, err := NewClient(config)
 	require.NoError(t, err, "Could not create client")

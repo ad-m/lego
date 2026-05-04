@@ -6,20 +6,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net/http"
-	"net/url"
-	"strings"
 	"time"
 
+	"github.com/go-acme/lego/v4/challenge"
 	"github.com/go-acme/lego/v4/challenge/dns01"
 	"github.com/go-acme/lego/v4/log"
 	"github.com/go-acme/lego/v4/platform/config/env"
-	"golang.org/x/oauth2/clientcredentials"
-)
-
-const (
-	defaultBaseURL = "https://gateway.stackpath.com/dns/v1/stacks/"
-	defaultAuthURL = "https://gateway.stackpath.com/identity/v1/oauth2/token"
+	"github.com/go-acme/lego/v4/providers/dns/internal/clientdebug"
+	"github.com/go-acme/lego/v4/providers/dns/stackpath/internal"
 )
 
 // Environment variables names.
@@ -35,6 +29,8 @@ const (
 	EnvPollingInterval    = envNamespace + "POLLING_INTERVAL"
 )
 
+var _ challenge.ProviderTimeout = (*DNSProvider)(nil)
+
 // Config is used to configure the creation of the DNSProvider.
 type Config struct {
 	ClientID           string
@@ -48,7 +44,7 @@ type Config struct {
 // NewDefaultConfig returns a default configuration for the DNSProvider.
 func NewDefaultConfig() *Config {
 	return &Config{
-		TTL:                env.GetOrDefaultInt(EnvTTL, 120),
+		TTL:                env.GetOrDefaultInt(EnvTTL, dns01.DefaultTTL),
 		PropagationTimeout: env.GetOrDefaultSecond(EnvPropagationTimeout, dns01.DefaultPropagationTimeout),
 		PollingInterval:    env.GetOrDefaultSecond(EnvPollingInterval, dns01.DefaultPollingInterval),
 	}
@@ -56,9 +52,8 @@ func NewDefaultConfig() *Config {
 
 // DNSProvider implements the challenge.Provider interface.
 type DNSProvider struct {
-	BaseURL *url.URL
-	client  *http.Client
-	config  *Config
+	config *Config
+	client *internal.Client
 }
 
 // NewDNSProvider returns a DNSProvider instance configured for Stackpath.
@@ -92,61 +87,65 @@ func NewDNSProviderConfig(config *Config) (*DNSProvider, error) {
 		return nil, errors.New("stackpath: stack id missing")
 	}
 
-	baseURL, _ := url.Parse(defaultBaseURL)
-
 	return &DNSProvider{
-		BaseURL: baseURL,
-		client:  getOathClient(config),
-		config:  config,
+		config: config,
+		client: internal.NewClient(config.StackID,
+			clientdebug.Wrap(
+				internal.CreateOAuthClient(context.Background(), config.ClientID, config.ClientSecret),
+			),
+		),
 	}, nil
-}
-
-func getOathClient(config *Config) *http.Client {
-	oathConfig := &clientcredentials.Config{
-		TokenURL:     defaultAuthURL,
-		ClientID:     config.ClientID,
-		ClientSecret: config.ClientSecret,
-	}
-
-	return oathConfig.Client(context.Background())
 }
 
 // Present creates a TXT record to fulfill the dns-01 challenge.
 func (d *DNSProvider) Present(domain, token, keyAuth string) error {
-	zone, err := d.getZones(domain)
+	info := dns01.GetChallengeInfo(domain, keyAuth)
+
+	ctx := context.Background()
+
+	zone, err := d.client.GetZones(ctx, info.EffectiveFQDN)
 	if err != nil {
 		return fmt.Errorf("stackpath: %w", err)
 	}
 
-	fqdn, value := dns01.GetRecord(domain, keyAuth)
-
-	record := Record{
-		Name: extractRecordName(fqdn, zone.Domain),
-		Type: "TXT",
-		TTL:  d.config.TTL,
-		Data: value,
+	subDomain, err := dns01.ExtractSubDomain(info.EffectiveFQDN, zone.Domain)
+	if err != nil {
+		return fmt.Errorf("stackpath: %w", err)
 	}
 
-	return d.createZoneRecord(zone, record)
+	record := internal.Record{
+		Name: subDomain,
+		Type: "TXT",
+		TTL:  d.config.TTL,
+		Data: info.Value,
+	}
+
+	return d.client.CreateZoneRecord(ctx, zone, record)
 }
 
 // CleanUp removes the TXT record matching the specified parameters.
 func (d *DNSProvider) CleanUp(domain, token, keyAuth string) error {
-	zone, err := d.getZones(domain)
+	info := dns01.GetChallengeInfo(domain, keyAuth)
+
+	ctx := context.Background()
+
+	zone, err := d.client.GetZones(ctx, info.EffectiveFQDN)
 	if err != nil {
 		return fmt.Errorf("stackpath: %w", err)
 	}
 
-	fqdn, _ := dns01.GetRecord(domain, keyAuth)
-	recordName := extractRecordName(fqdn, zone.Domain)
+	subDomain, err := dns01.ExtractSubDomain(info.EffectiveFQDN, zone.Domain)
+	if err != nil {
+		return fmt.Errorf("stackpath: %w", err)
+	}
 
-	records, err := d.getZoneRecords(recordName, zone)
+	records, err := d.client.GetZoneRecords(ctx, subDomain, zone)
 	if err != nil {
 		return err
 	}
 
 	for _, record := range records {
-		err = d.deleteZoneRecord(zone, record)
+		err = d.client.DeleteZoneRecord(ctx, zone, record)
 		if err != nil {
 			log.Printf("stackpath: failed to delete TXT record: %v", err)
 		}
@@ -159,12 +158,4 @@ func (d *DNSProvider) CleanUp(domain, token, keyAuth string) error {
 // Adjusting here to cope with spikes in propagation times.
 func (d *DNSProvider) Timeout() (timeout, interval time.Duration) {
 	return d.config.PropagationTimeout, d.config.PollingInterval
-}
-
-func extractRecordName(fqdn, zone string) string {
-	name := dns01.UnFqdn(fqdn)
-	if idx := strings.Index(name, "."+zone); idx != -1 {
-		return name[:idx]
-	}
-	return name
 }

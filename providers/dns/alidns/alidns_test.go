@@ -12,7 +12,8 @@ const envDomain = envNamespace + "DOMAIN"
 
 var envTest = tester.NewEnvTest(
 	EnvAccessKey,
-	EnvSecretKey).
+	EnvSecretKey,
+	EnvRAMRole).
 	WithDomain(envDomain)
 
 func TestNewDNSProvider(t *testing.T) {
@@ -26,6 +27,12 @@ func TestNewDNSProvider(t *testing.T) {
 			envVars: map[string]string{
 				EnvAccessKey: "123",
 				EnvSecretKey: "456",
+			},
+		},
+		{
+			desc: "success (RAM role)",
+			envVars: map[string]string{
+				EnvRAMRole: "LegoInstanceRole",
 			},
 		},
 		{
@@ -57,6 +64,7 @@ func TestNewDNSProvider(t *testing.T) {
 	for _, test := range testCases {
 		t.Run(test.desc, func(t *testing.T) {
 			defer envTest.RestoreEnv()
+
 			envTest.ClearEnv()
 
 			envTest.Apply(test.envVars)
@@ -78,6 +86,7 @@ func TestNewDNSProvider(t *testing.T) {
 func TestNewDNSProviderConfig(t *testing.T) {
 	testCases := []struct {
 		desc      string
+		ramRole   string
 		apiKey    string
 		secretKey string
 		expected  string
@@ -88,18 +97,22 @@ func TestNewDNSProviderConfig(t *testing.T) {
 			secretKey: "456",
 		},
 		{
+			desc:    "success",
+			ramRole: "LegoInstanceRole",
+		},
+		{
 			desc:     "missing credentials",
-			expected: "alicloud: credentials missing",
+			expected: "alicloud: ram role or credentials missing",
 		},
 		{
 			desc:      "missing api key",
 			secretKey: "456",
-			expected:  "alicloud: credentials missing",
+			expected:  "alicloud: ram role or credentials missing",
 		},
 		{
 			desc:     "missing secret key",
 			apiKey:   "123",
-			expected: "alicloud: credentials missing",
+			expected: "alicloud: ram role or credentials missing",
 		},
 	}
 
@@ -108,6 +121,7 @@ func TestNewDNSProviderConfig(t *testing.T) {
 			config := NewDefaultConfig()
 			config.APIKey = test.apiKey
 			config.SecretKey = test.secretKey
+			config.RAMRole = test.ramRole
 
 			p, err := NewDNSProviderConfig(config)
 
@@ -129,6 +143,7 @@ func TestLivePresent(t *testing.T) {
 	}
 
 	envTest.RestoreEnv()
+
 	provider, err := NewDNSProvider()
 	require.NoError(t, err)
 
@@ -142,6 +157,7 @@ func TestLiveCleanUp(t *testing.T) {
 	}
 
 	envTest.RestoreEnv()
+
 	provider, err := NewDNSProvider()
 	require.NoError(t, err)
 

@@ -6,18 +6,47 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
-	cloudflare "github.com/cloudflare/cloudflare-go"
+	"github.com/go-acme/lego/v4/challenge"
 	"github.com/go-acme/lego/v4/challenge/dns01"
 	"github.com/go-acme/lego/v4/log"
 	"github.com/go-acme/lego/v4/platform/config/env"
+	"github.com/go-acme/lego/v4/providers/dns/cloudflare/internal"
+)
+
+// Environment variables names.
+const (
+	envNamespace = "CLOUDFLARE_"
+
+	EnvEmail  = envNamespace + "EMAIL"
+	EnvAPIKey = envNamespace + "API_KEY"
+
+	EnvDNSAPIToken  = envNamespace + "DNS_API_TOKEN"
+	EnvZoneAPIToken = envNamespace + "ZONE_API_TOKEN"
+
+	EnvBaseURL = envNamespace + "BASE_URL"
+
+	EnvTTL                = envNamespace + "TTL"
+	EnvPropagationTimeout = envNamespace + "PROPAGATION_TIMEOUT"
+	EnvPollingInterval    = envNamespace + "POLLING_INTERVAL"
+	EnvHTTPTimeout        = envNamespace + "HTTP_TIMEOUT"
+)
+
+const (
+	altEnvNamespace = "CF_"
+
+	altEnvEmail = altEnvNamespace + "API_EMAIL"
 )
 
 const (
 	minTTL = 120
 )
+
+var _ challenge.ProviderTimeout = (*DNSProvider)(nil)
 
 // Config is used to configure the creation of the DNSProvider.
 type Config struct {
@@ -26,6 +55,8 @@ type Config struct {
 
 	AuthToken string
 	ZoneToken string
+
+	BaseURL string
 
 	TTL                int
 	PropagationTimeout time.Duration
@@ -36,11 +67,11 @@ type Config struct {
 // NewDefaultConfig returns a default configuration for the DNSProvider.
 func NewDefaultConfig() *Config {
 	return &Config{
-		TTL:                env.GetOrDefaultInt("CLOUDFLARE_TTL", minTTL),
-		PropagationTimeout: env.GetOrDefaultSecond("CLOUDFLARE_PROPAGATION_TIMEOUT", 2*time.Minute),
-		PollingInterval:    env.GetOrDefaultSecond("CLOUDFLARE_POLLING_INTERVAL", 2*time.Second),
+		TTL:                env.GetOneWithFallback(EnvTTL, minTTL, strconv.Atoi, altEnvName(EnvTTL)),
+		PropagationTimeout: env.GetOneWithFallback(EnvPropagationTimeout, 2*time.Minute, env.ParseSecond, altEnvName(EnvPropagationTimeout)),
+		PollingInterval:    env.GetOneWithFallback(EnvPollingInterval, dns01.DefaultPollingInterval, env.ParseSecond, altEnvName(EnvPollingInterval)),
 		HTTPClient: &http.Client{
-			Timeout: env.GetOrDefaultSecond("CLOUDFLARE_HTTP_TIMEOUT", 30*time.Second),
+			Timeout: env.GetOneWithFallback(EnvHTTPTimeout, 30*time.Second, env.ParseSecond, altEnvName(EnvHTTPTimeout)),
 		},
 	}
 }
@@ -63,31 +94,33 @@ type DNSProvider struct {
 // For a more paranoid setup, provide CLOUDFLARE_DNS_API_TOKEN and CLOUDFLARE_ZONE_API_TOKEN.
 //
 // The email and API key should be avoided, if possible.
-// Instead setup a API token with both Zone:Read and DNS:Edit permission, and pass the CLOUDFLARE_DNS_API_TOKEN environment variable.
+// Instead, set up an API token with both Zone:Read and DNS:Edit permission, and pass the CLOUDFLARE_DNS_API_TOKEN environment variable.
 // You can split the Zone:Read and DNS:Edit permissions across multiple API tokens:
 // in this case pass both CLOUDFLARE_ZONE_API_TOKEN and CLOUDFLARE_DNS_API_TOKEN accordingly.
 func NewDNSProvider() (*DNSProvider, error) {
 	values, err := env.GetWithFallback(
-		[]string{"CLOUDFLARE_EMAIL", "CF_API_EMAIL"},
-		[]string{"CLOUDFLARE_API_KEY", "CF_API_KEY"},
+		[]string{EnvEmail, altEnvEmail},
+		[]string{EnvAPIKey, altEnvName(EnvAPIKey)},
 	)
 	if err != nil {
 		var errT error
+
 		values, errT = env.GetWithFallback(
-			[]string{"CLOUDFLARE_DNS_API_TOKEN", "CF_DNS_API_TOKEN"},
-			[]string{"CLOUDFLARE_ZONE_API_TOKEN", "CF_ZONE_API_TOKEN", "CLOUDFLARE_DNS_API_TOKEN", "CF_DNS_API_TOKEN"},
+			[]string{EnvDNSAPIToken, altEnvName(EnvDNSAPIToken)},
+			[]string{EnvZoneAPIToken, altEnvName(EnvZoneAPIToken), EnvDNSAPIToken, altEnvName(EnvDNSAPIToken)},
 		)
 		if errT != nil {
-			// nolint:errorlint
+			//nolint:errorlint
 			return nil, fmt.Errorf("cloudflare: %v or %v", err, errT)
 		}
 	}
 
 	config := NewDefaultConfig()
-	config.AuthEmail = values["CLOUDFLARE_EMAIL"]
-	config.AuthKey = values["CLOUDFLARE_API_KEY"]
-	config.AuthToken = values["CLOUDFLARE_DNS_API_TOKEN"]
-	config.ZoneToken = values["CLOUDFLARE_ZONE_API_TOKEN"]
+	config.AuthEmail = values[EnvEmail]
+	config.AuthKey = values[EnvAPIKey]
+	config.AuthToken = values[EnvDNSAPIToken]
+	config.ZoneToken = values[EnvZoneAPIToken]
+	config.BaseURL = env.GetOrFile(EnvBaseURL)
 
 	return NewDNSProviderConfig(config)
 }
@@ -122,53 +155,53 @@ func (d *DNSProvider) Timeout() (timeout, interval time.Duration) {
 
 // Present creates a TXT record to fulfill the dns-01 challenge.
 func (d *DNSProvider) Present(domain, token, keyAuth string) error {
-	fqdn, value := dns01.GetRecord(domain, keyAuth)
+	ctx := context.Background()
 
-	authZone, err := dns01.FindZoneByFqdn(fqdn)
+	info := dns01.GetChallengeInfo(domain, keyAuth)
+
+	authZone, err := dns01.FindZoneByFqdn(info.EffectiveFQDN)
 	if err != nil {
-		return fmt.Errorf("cloudflare: %w", err)
+		return fmt.Errorf("cloudflare: could not find zone for domain %q: %w", domain, err)
 	}
 
-	zoneID, err := d.client.ZoneIDByName(authZone)
+	zoneID, err := d.client.ZoneIDByName(ctx, authZone)
 	if err != nil {
 		return fmt.Errorf("cloudflare: failed to find zone %s: %w", authZone, err)
 	}
 
-	dnsRecord := cloudflare.DNSRecord{
+	dnsRecord := internal.Record{
 		Type:    "TXT",
-		Name:    dns01.UnFqdn(fqdn),
-		Content: value,
+		Name:    dns01.UnFqdn(info.EffectiveFQDN),
+		Content: `"` + info.Value + `"`,
 		TTL:     d.config.TTL,
 	}
 
-	response, err := d.client.CreateDNSRecord(context.Background(), zoneID, dnsRecord)
+	response, err := d.client.CreateDNSRecord(ctx, zoneID, dnsRecord)
 	if err != nil {
 		return fmt.Errorf("cloudflare: failed to create TXT record: %w", err)
 	}
 
-	if !response.Success {
-		return fmt.Errorf("cloudflare: failed to create TXT record: %+v %+v", response.Errors, response.Messages)
-	}
-
 	d.recordIDsMu.Lock()
-	d.recordIDs[token] = response.Result.ID
+	d.recordIDs[token] = response.ID
 	d.recordIDsMu.Unlock()
 
-	log.Infof("cloudflare: new record for %s, ID %s", domain, response.Result.ID)
+	log.Infof("cloudflare: new record for %s, ID %s", domain, response.ID)
 
 	return nil
 }
 
 // CleanUp removes the TXT record matching the specified parameters.
 func (d *DNSProvider) CleanUp(domain, token, keyAuth string) error {
-	fqdn, _ := dns01.GetRecord(domain, keyAuth)
+	ctx := context.Background()
 
-	authZone, err := dns01.FindZoneByFqdn(fqdn)
+	info := dns01.GetChallengeInfo(domain, keyAuth)
+
+	authZone, err := dns01.FindZoneByFqdn(info.EffectiveFQDN)
 	if err != nil {
-		return fmt.Errorf("cloudflare: %w", err)
+		return fmt.Errorf("cloudflare: could not find zone for domain %q: %w", domain, err)
 	}
 
-	zoneID, err := d.client.ZoneIDByName(authZone)
+	zoneID, err := d.client.ZoneIDByName(ctx, authZone)
 	if err != nil {
 		return fmt.Errorf("cloudflare: failed to find zone %s: %w", authZone, err)
 	}
@@ -177,13 +210,14 @@ func (d *DNSProvider) CleanUp(domain, token, keyAuth string) error {
 	d.recordIDsMu.Lock()
 	recordID, ok := d.recordIDs[token]
 	d.recordIDsMu.Unlock()
+
 	if !ok {
-		return fmt.Errorf("cloudflare: unknown record ID for '%s'", fqdn)
+		return fmt.Errorf("cloudflare: unknown record ID for '%s'", info.EffectiveFQDN)
 	}
 
-	err = d.client.DeleteDNSRecord(context.Background(), zoneID, recordID)
+	err = d.client.DeleteDNSRecord(ctx, zoneID, recordID)
 	if err != nil {
-		log.Printf("cloudflare: failed to delete TXT record: %w", err)
+		log.Printf("cloudflare: failed to delete TXT record: %v", err)
 	}
 
 	// Delete record ID from map
@@ -192,4 +226,8 @@ func (d *DNSProvider) CleanUp(domain, token, keyAuth string) error {
 	d.recordIDsMu.Unlock()
 
 	return nil
+}
+
+func altEnvName(v string) string {
+	return strings.ReplaceAll(v, envNamespace, altEnvNamespace)
 }

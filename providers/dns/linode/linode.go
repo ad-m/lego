@@ -7,19 +7,15 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"strings"
 	"time"
 
+	"github.com/go-acme/lego/v4/challenge"
 	"github.com/go-acme/lego/v4/challenge/dns01"
 	"github.com/go-acme/lego/v4/platform/config/env"
+	"github.com/go-acme/lego/v4/providers/dns/internal/clientdebug"
+	"github.com/go-acme/lego/v4/providers/dns/internal/useragent"
 	"github.com/linode/linodego"
 	"golang.org/x/oauth2"
-)
-
-const (
-	minTTL             = 300
-	dnsUpdateFreqMins  = 15
-	dnsUpdateFudgeSecs = 120
 )
 
 // Environment variables names.
@@ -34,6 +30,14 @@ const (
 	EnvHTTPTimeout        = envNamespace + "HTTP_TIMEOUT"
 )
 
+const (
+	minTTL             = 300
+	dnsUpdateFreqMins  = 15
+	dnsUpdateFudgeSecs = 120
+)
+
+var _ challenge.ProviderTimeout = (*DNSProvider)(nil)
+
 // Config is used to configure the creation of the DNSProvider.
 type Config struct {
 	Token              string
@@ -47,9 +51,9 @@ type Config struct {
 func NewDefaultConfig() *Config {
 	return &Config{
 		TTL:                env.GetOrDefaultInt(EnvTTL, minTTL),
-		PropagationTimeout: env.GetOrDefaultSecond(EnvPropagationTimeout, 0),
+		PropagationTimeout: env.GetOrDefaultSecond(EnvPropagationTimeout, 120*time.Second),
 		PollingInterval:    env.GetOrDefaultSecond(EnvPollingInterval, 15*time.Second),
-		HTTPTimeout:        env.GetOrDefaultSecond(EnvHTTPTimeout, 0),
+		HTTPTimeout:        env.GetOrDefaultSecond(EnvHTTPTimeout, 30*time.Second),
 	}
 }
 
@@ -92,25 +96,21 @@ func NewDNSProviderConfig(config *Config) (*DNSProvider, error) {
 		return nil, fmt.Errorf("linode: invalid TTL, TTL (%d) must be greater than %d", config.TTL, minTTL)
 	}
 
-	tokenSource := oauth2.StaticTokenSource(&oauth2.Token{AccessToken: config.Token})
 	oauth2Client := &http.Client{
 		Timeout: config.HTTPTimeout,
 		Transport: &oauth2.Transport{
-			Source: tokenSource,
+			Source: oauth2.StaticTokenSource(&oauth2.Token{AccessToken: config.Token}),
 		},
 	}
 
-	client := linodego.NewClient(oauth2Client)
-	client.SetUserAgent("lego-dns https://github.com/linode/linodego")
+	client := linodego.NewClient(clientdebug.Wrap(oauth2Client))
+	client.SetUserAgent(useragent.Get())
 
-	return &DNSProvider{
-		config: config,
-		client: &client,
-	}, nil
+	return &DNSProvider{config: config, client: &client}, nil
 }
 
-// Timeout returns the timeout and interval to use when checking for DNS
-// propagation.  Adjusting here to cope with spikes in propagation times.
+// Timeout returns the timeout and interval to use when checking for DNS propagation.
+// Adjusting here to cope with spikes in propagation times.
 func (d *DNSProvider) Timeout() (time.Duration, time.Duration) {
 	timeout := d.config.PropagationTimeout
 	if d.config.PropagationTimeout <= 0 {
@@ -131,44 +131,51 @@ func (d *DNSProvider) Timeout() (time.Duration, time.Duration) {
 
 // Present creates a TXT record using the specified parameters.
 func (d *DNSProvider) Present(domain, token, keyAuth string) error {
-	fqdn, value := dns01.GetRecord(domain, keyAuth)
-	zone, err := d.getHostedZoneInfo(fqdn)
+	ctx := context.Background()
+
+	info := dns01.GetChallengeInfo(domain, keyAuth)
+
+	zone, err := d.getHostedZoneInfo(ctx, info.EffectiveFQDN)
 	if err != nil {
 		return err
 	}
 
 	createOpts := linodego.DomainRecordCreateOptions{
-		Name:   dns01.UnFqdn(fqdn),
-		Target: value,
+		Name:   dns01.UnFqdn(info.EffectiveFQDN),
+		Target: info.Value,
 		TTLSec: d.config.TTL,
 		Type:   linodego.RecordTypeTXT,
 	}
 
-	_, err = d.client.CreateDomainRecord(context.Background(), zone.domainID, createOpts)
+	_, err = d.client.CreateDomainRecord(ctx, zone.domainID, createOpts)
+
 	return err
 }
 
 // CleanUp removes the TXT record matching the specified parameters.
 func (d *DNSProvider) CleanUp(domain, token, keyAuth string) error {
-	fqdn, value := dns01.GetRecord(domain, keyAuth)
+	ctx := context.Background()
 
-	zone, err := d.getHostedZoneInfo(fqdn)
+	info := dns01.GetChallengeInfo(domain, keyAuth)
+
+	zone, err := d.getHostedZoneInfo(ctx, info.EffectiveFQDN)
 	if err != nil {
 		return err
 	}
 
 	// Get all TXT records for the specified domain.
-	listOpts := linodego.NewListOptions(0, "{\"type\":\"TXT\"}")
-	resources, err := d.client.ListDomainRecords(context.Background(), zone.domainID, listOpts)
+	listOpts := linodego.NewListOptions(0, `{"type":"TXT"}`)
+
+	resources, err := d.client.ListDomainRecords(ctx, zone.domainID, listOpts)
 	if err != nil {
 		return err
 	}
 
 	// Remove the specified resource, if it exists.
 	for _, resource := range resources {
-		if (resource.Name == strings.TrimSuffix(fqdn, ".") || resource.Name == zone.resourceName) &&
-			resource.Target == value {
-			if err := d.client.DeleteDomainRecord(context.Background(), zone.domainID, resource.ID); err != nil {
+		if (resource.Name == dns01.UnFqdn(info.EffectiveFQDN) || resource.Name == zone.resourceName) &&
+			resource.Target == info.Value {
+			if err := d.client.DeleteDomainRecord(ctx, zone.domainID, resource.ID); err != nil {
 				return err
 			}
 		}
@@ -177,21 +184,22 @@ func (d *DNSProvider) CleanUp(domain, token, keyAuth string) error {
 	return nil
 }
 
-func (d *DNSProvider) getHostedZoneInfo(fqdn string) (*hostedZoneInfo, error) {
+func (d *DNSProvider) getHostedZoneInfo(ctx context.Context, fqdn string) (*hostedZoneInfo, error) {
 	// Lookup the zone that handles the specified FQDN.
 	authZone, err := dns01.FindZoneByFqdn(fqdn)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("could not find zone: %w", err)
 	}
 
 	// Query the authority zone.
-	data, err := json.Marshal(map[string]string{"domain": dns01.UnFqdn(authZone)})
+	filter, err := json.Marshal(map[string]string{"domain": dns01.UnFqdn(authZone)})
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to create JSON filter: %w", err)
 	}
 
-	listOpts := linodego.NewListOptions(0, string(data))
-	domains, err := d.client.ListDomains(context.Background(), listOpts)
+	listOpts := linodego.NewListOptions(0, string(filter))
+
+	domains, err := d.client.ListDomains(ctx, listOpts)
 	if err != nil {
 		return nil, err
 	}
@@ -200,8 +208,13 @@ func (d *DNSProvider) getHostedZoneInfo(fqdn string) (*hostedZoneInfo, error) {
 		return nil, errors.New("domain not found")
 	}
 
+	subDomain, err := dns01.ExtractSubDomain(fqdn, authZone)
+	if err != nil {
+		return nil, err
+	}
+
 	return &hostedZoneInfo{
 		domainID:     domains[0].ID,
-		resourceName: strings.TrimSuffix(fqdn, "."+authZone),
+		resourceName: subDomain,
 	}, nil
 }

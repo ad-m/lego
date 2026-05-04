@@ -2,113 +2,55 @@ package internal
 
 import (
 	"encoding/json"
-	"io"
-	"io/ioutil"
-	"net/http"
 	"os"
 	"testing"
 
+	"github.com/go-acme/lego/v4/platform/tester/servermock"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 func TestTxtRecordService_Create(t *testing.T) {
-	client, handler, tearDown := setupAPIMock()
-	defer tearDown()
+	client := mockBuilder().
+		Route("POST /v1/domains/12345/records/txt", servermock.ResponseFromFixture("records-Create.json"),
+			servermock.CheckRequestJSONBody(`{"name":""}`)).
+		Build(t)
 
-	handler.HandleFunc("/v1/domains/12345/records/txt", func(rw http.ResponseWriter, req *http.Request) {
-		if req.Method != http.MethodPost {
-			http.Error(rw, "invalid method: "+req.Method, http.StatusBadRequest)
-			return
-		}
-
-		file, err := os.Open("./fixtures/records-Create.json")
-		if err != nil {
-			http.Error(rw, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		defer func() { _ = file.Close() }()
-
-		_, err = io.Copy(rw, file)
-		if err != nil {
-			http.Error(rw, err.Error(), http.StatusInternalServerError)
-			return
-		}
-	})
-
-	records, err := client.TxtRecords.Create(12345, RecordRequest{})
+	records, err := client.TxtRecords.Create(t.Context(), 12345, RecordRequest{})
 	require.NoError(t, err)
 
 	recordsJSON, err := json.Marshal(records)
 	require.NoError(t, err)
 
-	expectedContent, err := ioutil.ReadFile("./fixtures/records-Create.json")
+	expectedContent, err := os.ReadFile("./fixtures/records-Create.json")
 	require.NoError(t, err)
 
 	assert.JSONEq(t, string(expectedContent), string(recordsJSON))
 }
 
 func TestTxtRecordService_GetAll(t *testing.T) {
-	client, handler, tearDown := setupAPIMock()
-	defer tearDown()
+	client := mockBuilder().
+		Route("GET /v1/domains/12345/records/txt", servermock.ResponseFromFixture("records-GetAll.json")).
+		Build(t)
 
-	handler.HandleFunc("/v1/domains/12345/records/txt", func(rw http.ResponseWriter, req *http.Request) {
-		if req.Method != http.MethodGet {
-			http.Error(rw, "invalid method: "+req.Method, http.StatusBadRequest)
-			return
-		}
-
-		file, err := os.Open("./fixtures/records-GetAll.json")
-		if err != nil {
-			http.Error(rw, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		defer func() { _ = file.Close() }()
-
-		_, err = io.Copy(rw, file)
-		if err != nil {
-			http.Error(rw, err.Error(), http.StatusInternalServerError)
-			return
-		}
-	})
-
-	records, err := client.TxtRecords.GetAll(12345)
+	records, err := client.TxtRecords.GetAll(t.Context(), 12345)
 	require.NoError(t, err)
 
 	recordsJSON, err := json.Marshal(records)
 	require.NoError(t, err)
 
-	expectedContent, err := ioutil.ReadFile("./fixtures/records-GetAll.json")
+	expectedContent, err := os.ReadFile("./fixtures/records-GetAll.json")
 	require.NoError(t, err)
 
 	assert.JSONEq(t, string(expectedContent), string(recordsJSON))
 }
 
 func TestTxtRecordService_Get(t *testing.T) {
-	client, handler, tearDown := setupAPIMock()
-	defer tearDown()
+	client := mockBuilder().
+		Route("GET /v1/domains/12345/records/txt/6789", servermock.ResponseFromFixture("records-Get.json")).
+		Build(t)
 
-	handler.HandleFunc("/v1/domains/12345/records/txt/6789", func(rw http.ResponseWriter, req *http.Request) {
-		if req.Method != http.MethodGet {
-			http.Error(rw, "invalid method: "+req.Method, http.StatusBadRequest)
-			return
-		}
-
-		file, err := os.Open("./fixtures/records-Get.json")
-		if err != nil {
-			http.Error(rw, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		defer func() { _ = file.Close() }()
-
-		_, err = io.Copy(rw, file)
-		if err != nil {
-			http.Error(rw, err.Error(), http.StatusInternalServerError)
-			return
-		}
-	})
-
-	record, err := client.TxtRecords.Get(12345, 6789)
+	record, err := client.TxtRecords.Get(t.Context(), 12345, 6789)
 	require.NoError(t, err)
 
 	expected := &Record{
@@ -134,23 +76,12 @@ func TestTxtRecordService_Get(t *testing.T) {
 }
 
 func TestTxtRecordService_Update(t *testing.T) {
-	client, handler, tearDown := setupAPIMock()
-	defer tearDown()
+	client := mockBuilder().
+		Route("PUT /v1/domains/12345/records/txt/6789",
+			servermock.RawStringResponse(`{"success":"Record  updated successfully"}`)).
+		Build(t)
 
-	handler.HandleFunc("/v1/domains/12345/records/txt/6789", func(rw http.ResponseWriter, req *http.Request) {
-		if req.Method != http.MethodPut {
-			http.Error(rw, "invalid method: "+req.Method, http.StatusBadRequest)
-			return
-		}
-
-		_, err := rw.Write([]byte(`{"success":"Record  updated successfully"}`))
-		if err != nil {
-			http.Error(rw, err.Error(), http.StatusInternalServerError)
-			return
-		}
-	})
-
-	msg, err := client.TxtRecords.Update(12345, 6789, RecordRequest{})
+	msg, err := client.TxtRecords.Update(t.Context(), 12345, 6789, RecordRequest{})
 	require.NoError(t, err)
 
 	expected := &SuccessMessage{Success: "Record  updated successfully"}
@@ -158,23 +89,12 @@ func TestTxtRecordService_Update(t *testing.T) {
 }
 
 func TestTxtRecordService_Delete(t *testing.T) {
-	client, handler, tearDown := setupAPIMock()
-	defer tearDown()
+	client := mockBuilder().
+		Route("DELETE /v1/domains/12345/records/txt/6789",
+			servermock.RawStringResponse(`{"success":"Record  deleted successfully"}`)).
+		Build(t)
 
-	handler.HandleFunc("/v1/domains/12345/records/txt/6789", func(rw http.ResponseWriter, req *http.Request) {
-		if req.Method != http.MethodDelete {
-			http.Error(rw, "invalid method: "+req.Method, http.StatusBadRequest)
-			return
-		}
-
-		_, err := rw.Write([]byte(`{"success":"Record  deleted successfully"}`))
-		if err != nil {
-			http.Error(rw, err.Error(), http.StatusInternalServerError)
-			return
-		}
-	})
-
-	msg, err := client.TxtRecords.Delete(12345, 6789)
+	msg, err := client.TxtRecords.Delete(t.Context(), 12345, 6789)
 	require.NoError(t, err)
 
 	expected := &SuccessMessage{Success: "Record  deleted successfully"}
@@ -182,36 +102,17 @@ func TestTxtRecordService_Delete(t *testing.T) {
 }
 
 func TestTxtRecordService_Search(t *testing.T) {
-	client, handler, tearDown := setupAPIMock()
-	defer tearDown()
+	client := mockBuilder().
+		Route("GET /v1/domains/12345/records/txt/search", servermock.ResponseFromFixture("records-Search.json")).
+		Build(t)
 
-	handler.HandleFunc("/v1/domains/12345/records/txt/search", func(rw http.ResponseWriter, req *http.Request) {
-		if req.Method != http.MethodGet {
-			http.Error(rw, "invalid method: "+req.Method, http.StatusBadRequest)
-			return
-		}
-
-		file, err := os.Open("./fixtures/records-Search.json")
-		if err != nil {
-			http.Error(rw, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		defer func() { _ = file.Close() }()
-
-		_, err = io.Copy(rw, file)
-		if err != nil {
-			http.Error(rw, err.Error(), http.StatusInternalServerError)
-			return
-		}
-	})
-
-	records, err := client.TxtRecords.Search(12345, Exact, "test")
+	records, err := client.TxtRecords.Search(t.Context(), 12345, Exact, "test")
 	require.NoError(t, err)
 
 	recordsJSON, err := json.Marshal(records)
 	require.NoError(t, err)
 
-	expectedContent, err := ioutil.ReadFile("./fixtures/records-Search.json")
+	expectedContent, err := os.ReadFile("./fixtures/records-Search.json")
 	require.NoError(t, err)
 
 	assert.JSONEq(t, string(expectedContent), string(recordsJSON))

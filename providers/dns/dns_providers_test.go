@@ -13,6 +13,7 @@ var envTest = tester.NewEnvTest("EXEC_PATH")
 
 func TestKnownDNSProviderSuccess(t *testing.T) {
 	defer envTest.RestoreEnv()
+
 	envTest.Apply(map[string]string{
 		"EXEC_PATH": "abc",
 	})
@@ -26,15 +27,16 @@ func TestKnownDNSProviderSuccess(t *testing.T) {
 
 func TestKnownDNSProviderError(t *testing.T) {
 	defer envTest.RestoreEnv()
+
 	envTest.ClearEnv()
 
 	provider, err := NewDNSChallengeProviderByName("exec")
-	assert.Error(t, err)
+	require.Error(t, err)
 	assert.Nil(t, provider)
 }
 
 func TestUnknownDNSProvider(t *testing.T) {
 	provider, err := NewDNSChallengeProviderByName("foobar")
-	assert.Error(t, err)
+	require.Error(t, err)
 	assert.Nil(t, provider)
 }

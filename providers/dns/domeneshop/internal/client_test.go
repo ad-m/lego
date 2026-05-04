@@ -1,117 +1,58 @@
 package internal
 
 import (
-	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"testing"
 
+	"github.com/go-acme/lego/v4/platform/tester/servermock"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-func setup(t *testing.T) (*Client, *http.ServeMux) {
-	t.Helper()
+func mockBuilder() *servermock.Builder[*Client] {
+	return servermock.NewBuilder[*Client](
+		func(server *httptest.Server) (*Client, error) {
+			client := NewClient("token", "secret")
+			client.HTTPClient = server.Client()
+			client.baseURL, _ = url.Parse(server.URL)
 
-	mux := http.NewServeMux()
-
-	server := httptest.NewServer(mux)
-	t.Cleanup(server.Close)
-
-	client := NewClient("token", "secret")
-
-	client.baseURL = server.URL
-
-	return client, mux
+			return client, nil
+		},
+		servermock.CheckHeader().WithJSONHeaders().
+			WithBasicAuth("token", "secret"),
+	)
 }
 
 func TestClient_CreateTXTRecord(t *testing.T) {
-	client, mux := setup(t)
+	client := mockBuilder().
+		Route("POST /domains/1/dns",
+			servermock.ResponseFromFixture("create_record.json"),
+			servermock.CheckRequestJSONBodyFromFixture("create_record-request.json")).
+		Build(t)
 
-	mux.HandleFunc("/domains/1/dns", func(rw http.ResponseWriter, req *http.Request) {
-		if req.Method != http.MethodPost {
-			http.Error(rw, "invalid method: "+req.Method, http.StatusBadRequest)
-			return
-		}
-
-		auth := req.Header.Get("Authorization")
-		if auth != "Basic dG9rZW46c2VjcmV0" {
-			http.Error(rw, "invalid method: "+req.Method, http.StatusUnauthorized)
-		}
-
-		_, _ = rw.Write([]byte(`{"id": 1}`))
-	})
-
-	err := client.CreateTXTRecord(&Domain{ID: 1}, "example", "txtTXTtxt")
+	err := client.CreateTXTRecord(t.Context(), &Domain{ID: 1}, "example.com", "txtTXTtxt")
 	require.NoError(t, err)
 }
 
 func TestClient_DeleteTXTRecord(t *testing.T) {
-	client, mux := setup(t)
+	client := mockBuilder().
+		Route("GET /domains/1/dns",
+			servermock.ResponseFromFixture("delete_record.json")).
+		Route("DELETE /domains/1/dns/1", nil).
+		Build(t)
 
-	mux.HandleFunc("/domains/1/dns", func(rw http.ResponseWriter, req *http.Request) {
-		if req.Method != http.MethodGet {
-			http.Error(rw, "invalid method: "+req.Method, http.StatusBadRequest)
-			return
-		}
-
-		auth := req.Header.Get("Authorization")
-		if auth != "Basic dG9rZW46c2VjcmV0" {
-			http.Error(rw, "invalid method: "+req.Method, http.StatusUnauthorized)
-		}
-
-		_, _ = rw.Write([]byte(`[
-  {
-    "id": 1,
-    "host": "example.com",
-    "ttl": 3600,
-    "type": "TXT",
-    "data": "txtTXTtxt"
-  }
-]`))
-	})
-
-	mux.HandleFunc("/domains/1/dns/1", func(rw http.ResponseWriter, req *http.Request) {
-		if req.Method != http.MethodDelete {
-			http.Error(rw, "invalid method: "+req.Method, http.StatusBadRequest)
-			return
-		}
-
-		auth := req.Header.Get("Authorization")
-		if auth != "Basic dG9rZW46c2VjcmV0" {
-			http.Error(rw, "invalid method: "+req.Method, http.StatusUnauthorized)
-		}
-	})
-
-	err := client.DeleteTXTRecord(&Domain{ID: 1}, "example.com", "txtTXTtxt")
+	err := client.DeleteTXTRecord(t.Context(), &Domain{ID: 1}, "example.com", "txtTXTtxt")
 	require.NoError(t, err)
 }
 
 func TestClient_getDNSRecordByHostData(t *testing.T) {
-	client, mux := setup(t)
+	client := mockBuilder().
+		Route("GET /domains/1/dns",
+			servermock.ResponseFromFixture("getDnsRecords.json")).
+		Build(t)
 
-	mux.HandleFunc("/domains/1/dns", func(rw http.ResponseWriter, req *http.Request) {
-		if req.Method != http.MethodGet {
-			http.Error(rw, "invalid method: "+req.Method, http.StatusBadRequest)
-			return
-		}
-
-		auth := req.Header.Get("Authorization")
-		if auth != "Basic dG9rZW46c2VjcmV0" {
-			http.Error(rw, "invalid method: "+req.Method, http.StatusUnauthorized)
-		}
-
-		_, _ = rw.Write([]byte(`[
-  {
-    "id": 1,
-    "host": "example.com",
-    "ttl": 3600,
-    "type": "TXT",
-    "data": "txtTXTtxt"
-  }
-]`))
-	})
-
-	record, err := client.getDNSRecordByHostData(Domain{ID: 1}, "example.com", "txtTXTtxt")
+	record, err := client.getDNSRecordByHostData(t.Context(), Domain{ID: 1}, "example.com", "txtTXTtxt")
 	require.NoError(t, err)
 
 	expected := &DNSRecord{
@@ -126,44 +67,12 @@ func TestClient_getDNSRecordByHostData(t *testing.T) {
 }
 
 func TestClient_GetDomainByName(t *testing.T) {
-	client, mux := setup(t)
+	client := mockBuilder().
+		Route("GET /domains/",
+			servermock.ResponseFromFixture("getDomains.json")).
+		Build(t)
 
-	mux.HandleFunc("/domains", func(rw http.ResponseWriter, req *http.Request) {
-		if req.Method != http.MethodGet {
-			http.Error(rw, "invalid method: "+req.Method, http.StatusBadRequest)
-			return
-		}
-
-		auth := req.Header.Get("Authorization")
-		if auth != "Basic dG9rZW46c2VjcmV0" {
-			http.Error(rw, "invalid method: "+req.Method, http.StatusUnauthorized)
-		}
-
-		_, _ = rw.Write([]byte(`[
-  {
-    "id": 1,
-    "domain": "example.com",
-    "expiry_date": "2019-08-24",
-    "registered_date": "2019-08-24",
-    "renew": true,
-    "registrant": "Ola Nordmann",
-    "status": "active",
-    "nameservers": [
-      "ns1.hyp.net",
-      "ns2.hyp.net",
-      "ns3.hyp.net"
-    ],
-    "services": {
-      "registrar": true,
-      "dns": true,
-      "email": true,
-      "webhotel": "none"
-    }
-  }
-]`))
-	})
-
-	domain, err := client.GetDomainByName("example.com")
+	domain, err := client.GetDomainByName(t.Context(), "example.com")
 	require.NoError(t, err)
 
 	expected := &Domain{

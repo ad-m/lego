@@ -5,16 +5,14 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"strings"
 	"time"
 
+	"github.com/go-acme/lego/v4/challenge"
 	"github.com/go-acme/lego/v4/challenge/dns01"
 	"github.com/go-acme/lego/v4/platform/config/env"
-	"github.com/namedotcom/go/namecom"
+	"github.com/go-acme/lego/v4/providers/dns/internal/clientdebug"
+	"github.com/namedotcom/go/v4/namecom"
 )
-
-// according to https://www.name.com/api-docs/DNS#CreateRecord
-const minTTL = 300
 
 // Environment variables names.
 const (
@@ -29,6 +27,11 @@ const (
 	EnvPollingInterval    = envNamespace + "POLLING_INTERVAL"
 	EnvHTTPTimeout        = envNamespace + "HTTP_TIMEOUT"
 )
+
+// according to https://www.name.com/api-docs/DNS#CreateRecord
+const minTTL = 300
+
+var _ challenge.ProviderTimeout = (*DNSProvider)(nil)
 
 // Config is used to configure the creation of the DNSProvider.
 type Config struct {
@@ -95,7 +98,12 @@ func NewDNSProviderConfig(config *Config) (*DNSProvider, error) {
 	}
 
 	client := namecom.New(config.Username, config.APIToken)
-	client.Client = config.HTTPClient
+
+	if config.HTTPClient != nil {
+		client.Client = config.HTTPClient
+	}
+
+	client.Client = clientdebug.Wrap(client.Client)
 
 	if config.Server != "" {
 		client.Server = config.Server
@@ -106,19 +114,28 @@ func NewDNSProviderConfig(config *Config) (*DNSProvider, error) {
 
 // Present creates a TXT record to fulfill the dns-01 challenge.
 func (d *DNSProvider) Present(domain, token, keyAuth string) error {
-	fqdn, value := dns01.GetRecord(domain, keyAuth)
+	info := dns01.GetChallengeInfo(domain, keyAuth)
+
+	if info.EffectiveFQDN != info.FQDN {
+		domain = dns01.UnFqdn(info.EffectiveFQDN)
+	}
 
 	domainDetails, err := d.client.GetDomain(&namecom.GetDomainRequest{DomainName: domain})
 	if err != nil {
-		return fmt.Errorf("namedotcom API call failed: %w", err)
+		return fmt.Errorf("namedotcom: API call failed: %w", err)
+	}
+
+	subDomain, err := dns01.ExtractSubDomain(info.EffectiveFQDN, domainDetails.DomainName)
+	if err != nil {
+		return fmt.Errorf("namedotcom: %w", err)
 	}
 
 	request := &namecom.Record{
 		DomainName: domain,
-		Host:       extractRecordName(fqdn, domainDetails.DomainName),
+		Host:       subDomain,
 		Type:       "TXT",
 		TTL:        uint32(d.config.TTL),
-		Answer:     value,
+		Answer:     info.Value,
 	}
 
 	_, err = d.client.CreateRecord(request)
@@ -131,7 +148,11 @@ func (d *DNSProvider) Present(domain, token, keyAuth string) error {
 
 // CleanUp removes the TXT record matching the specified parameters.
 func (d *DNSProvider) CleanUp(domain, token, keyAuth string) error {
-	fqdn, _ := dns01.GetRecord(domain, keyAuth)
+	info := dns01.GetChallengeInfo(domain, keyAuth)
+
+	if info.EffectiveFQDN != info.FQDN {
+		domain = dns01.UnFqdn(info.EffectiveFQDN)
+	}
 
 	records, err := d.getRecords(domain)
 	if err != nil {
@@ -139,11 +160,12 @@ func (d *DNSProvider) CleanUp(domain, token, keyAuth string) error {
 	}
 
 	for _, rec := range records {
-		if rec.Fqdn == fqdn && rec.Type == "TXT" {
+		if rec.Fqdn == info.EffectiveFQDN && rec.Type == "TXT" {
 			request := &namecom.DeleteRecordRequest{
 				DomainName: domain,
 				ID:         rec.ID,
 			}
+
 			_, err := d.client.DeleteRecord(request)
 			if err != nil {
 				return fmt.Errorf("namedotcom: %w", err)
@@ -167,6 +189,7 @@ func (d *DNSProvider) getRecords(domain string) ([]*namecom.Record, error) {
 	}
 
 	var records []*namecom.Record
+
 	for request.Page > 0 {
 		response, err := d.client.ListRecords(request)
 		if err != nil {
@@ -178,12 +201,4 @@ func (d *DNSProvider) getRecords(domain string) ([]*namecom.Record, error) {
 	}
 
 	return records, nil
-}
-
-func extractRecordName(fqdn, zone string) string {
-	name := dns01.UnFqdn(fqdn)
-	if idx := strings.Index(name, "."+zone); idx != -1 {
-		return name[:idx]
-	}
-	return name
 }

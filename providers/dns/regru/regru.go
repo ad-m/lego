@@ -2,14 +2,17 @@
 package regru
 
 import (
+	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"net/http"
-	"strings"
 	"time"
 
+	"github.com/go-acme/lego/v4/challenge"
 	"github.com/go-acme/lego/v4/challenge/dns01"
 	"github.com/go-acme/lego/v4/platform/config/env"
+	"github.com/go-acme/lego/v4/providers/dns/internal/clientdebug"
 	"github.com/go-acme/lego/v4/providers/dns/regru/internal"
 )
 
@@ -19,6 +22,8 @@ const (
 
 	EnvUsername = envNamespace + "USERNAME"
 	EnvPassword = envNamespace + "PASSWORD"
+	EnvTLSCert  = envNamespace + "TLS_CERT"
+	EnvTLSKey   = envNamespace + "TLS_KEY"
 
 	EnvTTL                = envNamespace + "TTL"
 	EnvPropagationTimeout = envNamespace + "PROPAGATION_TIMEOUT"
@@ -26,10 +31,14 @@ const (
 	EnvHTTPTimeout        = envNamespace + "HTTP_TIMEOUT"
 )
 
+var _ challenge.ProviderTimeout = (*DNSProvider)(nil)
+
 // Config is used to configure the creation of the DNSProvider.
 type Config struct {
 	Username string
 	Password string
+	TLSCert  string
+	TLSKey   string
 
 	PropagationTimeout time.Duration
 	PollingInterval    time.Duration
@@ -67,6 +76,8 @@ func NewDNSProvider() (*DNSProvider, error) {
 	config := NewDefaultConfig()
 	config.Username = values[EnvUsername]
 	config.Password = values[EnvPassword]
+	config.TLSCert = env.GetOrDefaultString(EnvTLSCert, "")
+	config.TLSKey = env.GetOrDefaultString(EnvTLSKey, "")
 
 	return NewDNSProviderConfig(config)
 }
@@ -87,6 +98,29 @@ func NewDNSProviderConfig(config *Config) (*DNSProvider, error) {
 		client.HTTPClient = config.HTTPClient
 	}
 
+	client.HTTPClient = clientdebug.Wrap(client.HTTPClient)
+
+	if config.TLSCert != "" || config.TLSKey != "" {
+		if config.TLSCert == "" {
+			return nil, errors.New("regru: TLS certificate is missing")
+		}
+
+		if config.TLSKey == "" {
+			return nil, errors.New("regru: TLS key is missing")
+		}
+
+		tlsCert, err := tls.X509KeyPair([]byte(config.TLSCert), []byte(config.TLSKey))
+		if err != nil {
+			return nil, fmt.Errorf("regru: %w", err)
+		}
+
+		client.HTTPClient.Transport = &http.Transport{
+			TLSClientConfig: &tls.Config{
+				Certificates: []tls.Certificate{tlsCert},
+			},
+		}
+	}
+
 	return &DNSProvider{config: config, client: client}, nil
 }
 
@@ -98,15 +132,19 @@ func (d *DNSProvider) Timeout() (timeout, interval time.Duration) {
 
 // Present creates a TXT record using the specified parameters.
 func (d *DNSProvider) Present(domain, token, keyAuth string) error {
-	fqdn, value := dns01.GetRecord(domain, keyAuth)
+	info := dns01.GetChallengeInfo(domain, keyAuth)
 
-	authZone, err := dns01.FindZoneByFqdn(fqdn)
+	authZone, err := dns01.FindZoneByFqdn(info.EffectiveFQDN)
 	if err != nil {
-		return fmt.Errorf("regru: could not find zone for domain %q and fqdn %q : %w", domain, fqdn, err)
+		return fmt.Errorf("regru: could not find zone for domain %q: %w", domain, err)
 	}
 
-	subDomain := dns01.UnFqdn(strings.TrimSuffix(fqdn, authZone))
-	err = d.client.AddTXTRecord(dns01.UnFqdn(authZone), subDomain, value)
+	subDomain, err := dns01.ExtractSubDomain(info.EffectiveFQDN, authZone)
+	if err != nil {
+		return fmt.Errorf("regru: %w", err)
+	}
+
+	err = d.client.AddTXTRecord(context.Background(), dns01.UnFqdn(authZone), subDomain, info.Value)
 	if err != nil {
 		return fmt.Errorf("regru: failed to create TXT records [domain: %s, sub domain: %s]: %w",
 			dns01.UnFqdn(authZone), subDomain, err)
@@ -117,15 +155,19 @@ func (d *DNSProvider) Present(domain, token, keyAuth string) error {
 
 // CleanUp removes the TXT record matching the specified parameters.
 func (d *DNSProvider) CleanUp(domain, token, keyAuth string) error {
-	fqdn, value := dns01.GetRecord(domain, keyAuth)
+	info := dns01.GetChallengeInfo(domain, keyAuth)
 
-	authZone, err := dns01.FindZoneByFqdn(fqdn)
+	authZone, err := dns01.FindZoneByFqdn(info.EffectiveFQDN)
 	if err != nil {
-		return fmt.Errorf("regru: could not find zone for domain %q and fqdn %q : %w", domain, fqdn, err)
+		return fmt.Errorf("regru: could not find zone for domain %q: %w", domain, err)
 	}
 
-	subDomain := dns01.UnFqdn(strings.TrimSuffix(fqdn, authZone))
-	err = d.client.RemoveTxtRecord(dns01.UnFqdn(authZone), subDomain, value)
+	subDomain, err := dns01.ExtractSubDomain(info.EffectiveFQDN, authZone)
+	if err != nil {
+		return fmt.Errorf("regru: %w", err)
+	}
+
+	err = d.client.RemoveTxtRecord(context.Background(), dns01.UnFqdn(authZone), subDomain, info.Value)
 	if err != nil {
 		return fmt.Errorf("regru: failed to remove TXT records [domain: %s, sub domain: %s]: %w",
 			dns01.UnFqdn(authZone), subDomain, err)

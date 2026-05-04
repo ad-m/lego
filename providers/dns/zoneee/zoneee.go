@@ -2,14 +2,18 @@
 package zoneee
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
 	"time"
 
+	"github.com/go-acme/lego/v4/challenge"
 	"github.com/go-acme/lego/v4/challenge/dns01"
 	"github.com/go-acme/lego/v4/platform/config/env"
+	"github.com/go-acme/lego/v4/providers/dns/internal/clientdebug"
+	"github.com/go-acme/lego/v4/providers/dns/zoneee/internal"
 )
 
 // Environment variables names.
@@ -25,6 +29,8 @@ const (
 	EnvHTTPTimeout        = envNamespace + "HTTP_TIMEOUT"
 )
 
+var _ challenge.ProviderTimeout = (*DNSProvider)(nil)
+
 // Config is used to configure the creation of the DNSProvider.
 type Config struct {
 	Endpoint           *url.URL
@@ -37,7 +43,7 @@ type Config struct {
 
 // NewDefaultConfig returns a default configuration for the DNSProvider.
 func NewDefaultConfig() *Config {
-	endpoint, _ := url.Parse(defaultEndpoint)
+	endpoint, _ := url.Parse(internal.DefaultEndpoint)
 
 	return &Config{
 		Endpoint: endpoint,
@@ -53,6 +59,7 @@ func NewDefaultConfig() *Config {
 // DNSProvider implements the challenge.Provider interface.
 type DNSProvider struct {
 	config *Config
+	client *internal.Client
 }
 
 // NewDNSProvider returns a DNSProvider instance.
@@ -62,7 +69,8 @@ func NewDNSProvider() (*DNSProvider, error) {
 		return nil, fmt.Errorf("zoneee: %w", err)
 	}
 
-	rawEndpoint := env.GetOrDefaultString(EnvEndpoint, defaultEndpoint)
+	rawEndpoint := env.GetOrDefaultString(EnvEndpoint, internal.DefaultEndpoint)
+
 	endpoint, err := url.Parse(rawEndpoint)
 	if err != nil {
 		return nil, fmt.Errorf("zoneee: %w", err)
@@ -94,7 +102,19 @@ func NewDNSProviderConfig(config *Config) (*DNSProvider, error) {
 		return nil, errors.New("zoneee: the endpoint is missing")
 	}
 
-	return &DNSProvider{config: config}, nil
+	client := internal.NewClient(config.Username, config.APIKey)
+
+	if config.HTTPClient != nil {
+		client.HTTPClient = config.HTTPClient
+	}
+
+	client.HTTPClient = clientdebug.Wrap(client.HTTPClient)
+
+	if config.Endpoint != nil {
+		client.BaseURL = config.Endpoint
+	}
+
+	return &DNSProvider{config: config, client: client}, nil
 }
 
 // Timeout returns the timeout and interval to use when checking for DNS propagation.
@@ -105,63 +125,61 @@ func (d *DNSProvider) Timeout() (timeout, interval time.Duration) {
 
 // Present creates a TXT record to fulfill the dns-01 challenge.
 func (d *DNSProvider) Present(domain, token, keyAuth string) error {
-	fqdn, value := dns01.GetRecord(domain, keyAuth)
+	info := dns01.GetChallengeInfo(domain, keyAuth)
 
-	record := txtRecord{
-		Name:        fqdn[:len(fqdn)-1],
-		Destination: value,
+	authZone, err := dns01.FindZoneByFqdn(info.EffectiveFQDN)
+	if err != nil {
+		return fmt.Errorf("zoneee: could not find zone for domain %q: %w", domain, err)
 	}
 
-	authZone, err := getHostedZone(domain)
+	authZone = dns01.UnFqdn(authZone)
+
+	record := internal.TXTRecord{
+		Name:        dns01.UnFqdn(info.EffectiveFQDN),
+		Destination: info.Value,
+	}
+
+	_, err = d.client.AddTxtRecord(context.Background(), authZone, record)
 	if err != nil {
 		return fmt.Errorf("zoneee: %w", err)
 	}
 
-	_, err = d.addTxtRecord(authZone, record)
-	if err != nil {
-		return fmt.Errorf("zoneee: %w", err)
-	}
 	return nil
 }
 
 // CleanUp removes the TXT record previously created.
 func (d *DNSProvider) CleanUp(domain, token, keyAuth string) error {
-	_, value := dns01.GetRecord(domain, keyAuth)
+	info := dns01.GetChallengeInfo(domain, keyAuth)
 
-	authZone, err := getHostedZone(domain)
+	authZone, err := dns01.FindZoneByFqdn(info.EffectiveFQDN)
 	if err != nil {
-		return fmt.Errorf("zoneee: %w", err)
+		return fmt.Errorf("zoneee: could not find zone for domain %q: %w", domain, err)
 	}
 
-	records, err := d.getTxtRecords(authZone)
+	authZone = dns01.UnFqdn(authZone)
+
+	ctx := context.Background()
+
+	records, err := d.client.GetTxtRecords(ctx, authZone)
 	if err != nil {
 		return fmt.Errorf("zoneee: %w", err)
 	}
 
 	var id string
+
 	for _, record := range records {
-		if record.Destination == value {
+		if record.Destination == info.Value {
 			id = record.ID
 		}
 	}
 
 	if id == "" {
-		return fmt.Errorf("zoneee: txt record does not exist for %s", value)
+		return fmt.Errorf("zoneee: txt record does not exist for %s", info.Value)
 	}
 
-	if err = d.removeTxtRecord(authZone, id); err != nil {
+	if err = d.client.RemoveTxtRecord(ctx, authZone, id); err != nil {
 		return fmt.Errorf("zoneee: %w", err)
 	}
 
 	return nil
-}
-
-func getHostedZone(domain string) (string, error) {
-	authZone, err := dns01.FindZoneByFqdn(dns01.ToFqdn(domain))
-	if err != nil {
-		return "", err
-	}
-
-	zoneName := dns01.UnFqdn(authZone)
-	return zoneName, nil
 }

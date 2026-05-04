@@ -23,11 +23,12 @@ type TokenTransport struct {
 	Transport http.RoundTripper
 }
 
-// NewTokenTransport Creates a HTTP transport for API authentication.
+// NewTokenTransport Creates an HTTP transport for API authentication.
 func NewTokenTransport(apiKey, secretKey string) (*TokenTransport, error) {
 	if apiKey == "" {
 		return nil, errors.New("credentials missing: API key")
 	}
+
 	if secretKey == "" {
 		return nil, errors.New("credentials missing: secret key")
 	}
@@ -57,6 +58,7 @@ func (t *TokenTransport) transport() http.RoundTripper {
 	if t.Transport != nil {
 		return t.Transport
 	}
+
 	return http.DefaultTransport
 }
 
@@ -65,7 +67,7 @@ func (t *TokenTransport) Client() *http.Client {
 	return &http.Client{Transport: t}
 }
 
-// Wrap Wrap a HTTP client Transport with the TokenTransport.
+// Wrap wraps an HTTP client Transport with the TokenTransport.
 func (t *TokenTransport) Wrap(client *http.Client) *http.Client {
 	backup := client.Transport
 	t.Transport = backup

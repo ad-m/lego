@@ -7,9 +7,11 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/go-acme/lego/v4/challenge"
 	"github.com/go-acme/lego/v4/challenge/dns01"
 	"github.com/go-acme/lego/v4/platform/config/env"
-	"github.com/labbsr0x/bindman-dns-webhook/src/client"
+	"github.com/go-acme/lego/v4/providers/dns/internal/clientdebug"
+	bindman "github.com/labbsr0x/bindman-dns-webhook/src/client"
 )
 
 // Environment variables names.
@@ -22,6 +24,8 @@ const (
 	EnvPollingInterval    = envNamespace + "POLLING_INTERVAL"
 	EnvHTTPTimeout        = envNamespace + "HTTP_TIMEOUT"
 )
+
+var _ challenge.ProviderTimeout = (*DNSProvider)(nil)
 
 // Config is used to configure the creation of the DNSProvider.
 type Config struct {
@@ -45,7 +49,7 @@ func NewDefaultConfig() *Config {
 // DNSProvider implements the challenge.Provider interface.
 type DNSProvider struct {
 	config *Config
-	client *client.DNSWebhookClient
+	client *bindman.DNSWebhookClient
 }
 
 // NewDNSProvider returns a DNSProvider instance configured for Bindman.
@@ -72,33 +76,40 @@ func NewDNSProviderConfig(config *Config) (*DNSProvider, error) {
 		return nil, errors.New("bindman: bindman manager address missing")
 	}
 
-	bClient, err := client.New(config.BaseURL, config.HTTPClient)
+	// Because the client.New uses the http.DefaultClient.
+	if config.HTTPClient == nil {
+		config.HTTPClient = &http.Client{Timeout: time.Minute}
+	}
+
+	client, err := bindman.New(config.BaseURL, clientdebug.Wrap(config.HTTPClient))
 	if err != nil {
 		return nil, fmt.Errorf("bindman: %w", err)
 	}
 
-	return &DNSProvider{config: config, client: bClient}, nil
+	return &DNSProvider{config: config, client: client}, nil
 }
 
 // Present creates a TXT record using the specified parameters.
 // This will *not* create a subzone to contain the TXT record,
 // so make sure the FQDN specified is within an extant zone.
 func (d *DNSProvider) Present(domain, token, keyAuth string) error {
-	fqdn, value := dns01.GetRecord(domain, keyAuth)
+	info := dns01.GetChallengeInfo(domain, keyAuth)
 
-	if err := d.client.AddRecord(fqdn, "TXT", value); err != nil {
+	if err := d.client.AddRecord(info.EffectiveFQDN, "TXT", info.Value); err != nil {
 		return fmt.Errorf("bindman: %w", err)
 	}
+
 	return nil
 }
 
 // CleanUp removes the TXT record matching the specified parameters.
 func (d *DNSProvider) CleanUp(domain, token, keyAuth string) error {
-	fqdn, _ := dns01.GetRecord(domain, keyAuth)
+	info := dns01.GetChallengeInfo(domain, keyAuth)
 
-	if err := d.client.RemoveRecord(fqdn, "TXT"); err != nil {
+	if err := d.client.RemoveRecord(info.EffectiveFQDN, "TXT"); err != nil {
 		return fmt.Errorf("bindman: %w", err)
 	}
+
 	return nil
 }
 

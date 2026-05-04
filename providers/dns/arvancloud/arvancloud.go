@@ -2,19 +2,19 @@
 package arvancloud
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
-	"strings"
 	"sync"
 	"time"
 
+	"github.com/go-acme/lego/v4/challenge"
 	"github.com/go-acme/lego/v4/challenge/dns01"
 	"github.com/go-acme/lego/v4/platform/config/env"
 	"github.com/go-acme/lego/v4/providers/dns/arvancloud/internal"
+	"github.com/go-acme/lego/v4/providers/dns/internal/clientdebug"
 )
-
-const minTTL = 600
 
 // Environment variables names.
 const (
@@ -27,6 +27,10 @@ const (
 	EnvPollingInterval    = envNamespace + "POLLING_INTERVAL"
 	EnvHTTPTimeout        = envNamespace + "HTTP_TIMEOUT"
 )
+
+const minTTL = 600
+
+var _ challenge.ProviderTimeout = (*DNSProvider)(nil)
 
 // Config is used to configure the creation of the DNSProvider.
 type Config struct {
@@ -92,6 +96,8 @@ func NewDNSProviderConfig(config *Config) (*DNSProvider, error) {
 		client.HTTPClient = config.HTTPClient
 	}
 
+	client.HTTPClient = clientdebug.Wrap(client.HTTPClient)
+
 	return &DNSProvider{
 		config:    config,
 		client:    client,
@@ -99,25 +105,32 @@ func NewDNSProviderConfig(config *Config) (*DNSProvider, error) {
 	}, nil
 }
 
-// Timeout returns the timeout and interval to use when checking for DNS
-// propagation. Adjusting here to cope with spikes in propagation times.
+// Timeout returns the timeout and interval to use when checking for DNS propagation.
+// Adjusting here to cope with spikes in propagation times.
 func (d *DNSProvider) Timeout() (timeout, interval time.Duration) {
 	return d.config.PropagationTimeout, d.config.PollingInterval
 }
 
 // Present creates a TXT record to fulfill the dns-01 challenge.
 func (d *DNSProvider) Present(domain, token, keyAuth string) error {
-	fqdn, value := dns01.GetRecord(domain, keyAuth)
+	info := dns01.GetChallengeInfo(domain, keyAuth)
 
-	authZone, err := getZone(fqdn)
+	authZone, err := dns01.FindZoneByFqdn(info.EffectiveFQDN)
 	if err != nil {
-		return err
+		return fmt.Errorf("arvancloud: could not find zone for domain %q: %w", domain, err)
+	}
+
+	authZone = dns01.UnFqdn(authZone)
+
+	subDomain, err := dns01.ExtractSubDomain(info.EffectiveFQDN, authZone)
+	if err != nil {
+		return fmt.Errorf("arvancloud: %w", err)
 	}
 
 	record := internal.DNSRecord{
 		Type:          "txt",
-		Name:          extractRecordName(fqdn, authZone),
-		Value:         internal.TXTRecordValue{Text: value},
+		Name:          subDomain,
+		Value:         internal.TXTRecordValue{Text: info.Value},
 		TTL:           d.config.TTL,
 		UpstreamHTTPS: "default",
 		IPFilterMode: &internal.IPFilterMode{
@@ -127,9 +140,9 @@ func (d *DNSProvider) Present(domain, token, keyAuth string) error {
 		},
 	}
 
-	newRecord, err := d.client.CreateRecord(authZone, record)
+	newRecord, err := d.client.CreateRecord(context.Background(), authZone, record)
 	if err != nil {
-		return fmt.Errorf("arvancloud: failed to add TXT record: fqdn=%s: %w", fqdn, err)
+		return fmt.Errorf("arvancloud: failed to add TXT record: fqdn=%s: %w", info.EffectiveFQDN, err)
 	}
 
 	d.recordIDsMu.Lock()
@@ -141,23 +154,26 @@ func (d *DNSProvider) Present(domain, token, keyAuth string) error {
 
 // CleanUp removes the TXT record matching the specified parameters.
 func (d *DNSProvider) CleanUp(domain, token, keyAuth string) error {
-	fqdn, _ := dns01.GetRecord(domain, keyAuth)
+	info := dns01.GetChallengeInfo(domain, keyAuth)
 
-	authZone, err := getZone(fqdn)
+	authZone, err := dns01.FindZoneByFqdn(info.EffectiveFQDN)
 	if err != nil {
-		return err
+		return fmt.Errorf("arvancloud: could not find zone for domain %q: %w", domain, err)
 	}
+
+	authZone = dns01.UnFqdn(authZone)
 
 	// gets the record's unique ID from when we created it
 	d.recordIDsMu.Lock()
 	recordID, ok := d.recordIDs[token]
 	d.recordIDsMu.Unlock()
+
 	if !ok {
-		return fmt.Errorf("arvancloud: unknown record ID for '%s' '%s'", fqdn, token)
+		return fmt.Errorf("arvancloud: unknown record ID for '%s' '%s'", info.EffectiveFQDN, token)
 	}
 
-	if err := d.client.DeleteRecord(authZone, recordID); err != nil {
-		return fmt.Errorf("arvancloud: failed to delate TXT record: id=%s: %w", recordID, err)
+	if err := d.client.DeleteRecord(context.Background(), authZone, recordID); err != nil {
+		return fmt.Errorf("arvancloud: failed to delete TXT record: id=%s: %w", recordID, err)
 	}
 
 	// deletes record ID from map
@@ -166,21 +182,4 @@ func (d *DNSProvider) CleanUp(domain, token, keyAuth string) error {
 	d.recordIDsMu.Unlock()
 
 	return nil
-}
-
-func getZone(fqdn string) (string, error) {
-	authZone, err := dns01.FindZoneByFqdn(fqdn)
-	if err != nil {
-		return "", err
-	}
-
-	return dns01.UnFqdn(authZone), nil
-}
-
-func extractRecordName(fqdn, zone string) string {
-	name := dns01.UnFqdn(fqdn)
-	if idx := strings.Index(name, "."+zone); idx != -1 {
-		return name[:idx]
-	}
-	return name
 }

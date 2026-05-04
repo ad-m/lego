@@ -2,8 +2,12 @@ package http01
 
 import (
 	"fmt"
+	"net"
 	"net/http"
+	"net/netip"
 	"strings"
+
+	"github.com/miekg/dns"
 )
 
 // A domainMatcher tries to match a domain (the one we're requesting a certificate for)
@@ -23,14 +27,17 @@ import (
 // RFC7239 has standardized the different forwarding headers into a single header named Forwarded.
 // The header value has a different format, so you should use forwardedMatcher
 // when the http01.ProviderServer operates behind a RFC7239 compatible proxy.
-// https://tools.ietf.org/html/rfc7239
+// https://www.rfc-editor.org/rfc/rfc7239.html
 //
 // Note: RFC7239 also reminds us, "that an HTTP list [...] may be split over multiple header fields" (section 7.1),
 // meaning that
-//   X-Header: a
-//   X-Header: b
+//
+//	X-Header: a
+//	X-Header: b
+//
 // is equal to
-//   X-Header: a, b
+//
+//	X-Header: a, b
 //
 // All matcher implementations (explicitly not excluding arbitraryMatcher!)
 // have in common that they only match against the first value in such lists.
@@ -51,10 +58,10 @@ func (m *hostMatcher) name() string {
 }
 
 func (m *hostMatcher) matches(r *http.Request, domain string) bool {
-	return strings.HasPrefix(r.Host, domain)
+	return matchDomain(r.Host, domain)
 }
 
-// hostMatcher checks whether the specified (*net/http.Request).Header value starts with a domain name.
+// arbitraryMatcher checks whether the specified (*net/http.Request).Header value starts with a domain name.
 type arbitraryMatcher string
 
 func (m arbitraryMatcher) name() string {
@@ -62,11 +69,13 @@ func (m arbitraryMatcher) name() string {
 }
 
 func (m arbitraryMatcher) matches(r *http.Request, domain string) bool {
-	return strings.HasPrefix(r.Header.Get(m.name()), domain)
+	first, _, _ := strings.Cut(r.Header.Get(m.name()), ",")
+
+	return matchDomain(first, domain)
 }
 
 // forwardedMatcher checks whether the Forwarded header contains a "host" element starting with a domain name.
-// See https://tools.ietf.org/html/rfc7239 for details.
+// See https://www.rfc-editor.org/rfc/rfc7239.html for details.
 type forwardedMatcher struct{}
 
 func (m *forwardedMatcher) name() string {
@@ -84,7 +93,8 @@ func (m *forwardedMatcher) matches(r *http.Request, domain string) bool {
 	}
 
 	host := fwds[0]["host"]
-	return strings.HasPrefix(host, domain)
+
+	return matchDomain(host, domain)
 }
 
 // parsing requires some form of state machine.
@@ -95,6 +105,7 @@ func parseForwardedHeader(s string) (elements []map[string]string, err error) {
 	inquote := false
 
 	pos := 0
+
 	l := len(s)
 	for i := 0; i < l; i++ {
 		r := rune(s[i])
@@ -106,6 +117,7 @@ func parseForwardedHeader(s string) (elements []map[string]string, err error) {
 				pos = i
 				inquote = false
 			}
+
 			continue
 		}
 
@@ -114,6 +126,7 @@ func parseForwardedHeader(s string) (elements []map[string]string, err error) {
 			if key == "" {
 				return nil, fmt.Errorf("unexpected quoted string as pos %d", i)
 			}
+
 			inquote = true
 			pos = i + 1
 
@@ -130,11 +143,10 @@ func parseForwardedHeader(s string) (elements []map[string]string, err error) {
 
 		case r == ',': // end of forwarded-element
 			if key != "" {
-				if val == "" {
-					val = s[pos:i]
-				}
+				val = s[pos:i]
 				cur[key] = val
 			}
+
 			elements = append(elements, cur)
 			cur = make(map[string]string)
 			key = ""
@@ -157,11 +169,14 @@ func parseForwardedHeader(s string) (elements []map[string]string, err error) {
 		if pos < len(s) {
 			val = s[pos:]
 		}
+
 		cur[key] = val
 	}
+
 	if len(cur) > 0 {
 		elements = append(elements, cur)
 	}
+
 	return elements, nil
 }
 
@@ -176,9 +191,42 @@ func skipWS(s string, i int) int {
 	for isWS(rune(s[i+1])) {
 		i++
 	}
+
 	return i
 }
 
 func isWS(r rune) bool {
 	return strings.ContainsRune(" \t\v\r\n", r)
+}
+
+func matchDomain(src, domain string) bool {
+	addr, err := netip.ParseAddr(domain)
+	if err == nil && addr.Is6() {
+		domain = "[" + domain + "]"
+	}
+
+	if len(src) < len(domain) {
+		return false
+	}
+
+	// Case-insensitive prefix (domain) match.
+	if !strings.EqualFold(dns.Fqdn(src[:len(domain)]), dns.Fqdn(domain)) {
+		return false
+	}
+
+	if strings.EqualFold(dns.Fqdn(src), dns.Fqdn(domain)) {
+		return true
+	}
+
+	host, _, err := net.SplitHostPort(src)
+	if err != nil {
+		return false
+	}
+
+	addr, err = netip.ParseAddr(host)
+	if err == nil && addr.Is6() {
+		host = "[" + host + "]"
+	}
+
+	return strings.EqualFold(dns.Fqdn(host), dns.Fqdn(domain))
 }

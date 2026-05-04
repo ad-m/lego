@@ -2,19 +2,18 @@
 package rackspace
 
 import (
-	"bytes"
-	"encoding/json"
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
 	"time"
 
+	"github.com/go-acme/lego/v4/challenge"
 	"github.com/go-acme/lego/v4/challenge/dns01"
 	"github.com/go-acme/lego/v4/platform/config/env"
+	"github.com/go-acme/lego/v4/providers/dns/internal/clientdebug"
+	"github.com/go-acme/lego/v4/providers/dns/rackspace/internal"
 )
-
-// defaultBaseURL represents the Identity API endpoint to call.
-const defaultBaseURL = "https://identity.api.rackspacecloud.com/v2.0/tokens"
 
 // Environment variables names.
 const (
@@ -28,6 +27,8 @@ const (
 	EnvPollingInterval    = envNamespace + "POLLING_INTERVAL"
 	EnvHTTPTimeout        = envNamespace + "HTTP_TIMEOUT"
 )
+
+var _ challenge.ProviderTimeout = (*DNSProvider)(nil)
 
 // Config is used to configure the creation of the DNSProvider.
 type Config struct {
@@ -43,7 +44,7 @@ type Config struct {
 // NewDefaultConfig returns a default configuration for the DNSProvider.
 func NewDefaultConfig() *Config {
 	return &Config{
-		BaseURL:            defaultBaseURL,
+		BaseURL:            internal.DefaultIdentityURL,
 		TTL:                env.GetOrDefaultInt(EnvTTL, 300),
 		PropagationTimeout: env.GetOrDefaultSecond(EnvPropagationTimeout, dns01.DefaultPropagationTimeout),
 		PollingInterval:    env.GetOrDefaultSecond(EnvPollingInterval, dns01.DefaultPollingInterval),
@@ -55,7 +56,9 @@ func NewDefaultConfig() *Config {
 
 // DNSProvider implements the challenge.Provider interface.
 type DNSProvider struct {
-	config           *Config
+	config *Config
+	client *internal.Client
+
 	token            string
 	cloudDNSEndpoint string
 }
@@ -87,13 +90,16 @@ func NewDNSProviderConfig(config *Config) (*DNSProvider, error) {
 		return nil, errors.New("rackspace: credentials missing")
 	}
 
-	identity, err := login(config)
+	identifier := internal.NewIdentifier(config.HTTPClient, config.BaseURL)
+
+	identity, err := identifier.Login(context.Background(), config.APIUser, config.APIKey)
 	if err != nil {
 		return nil, fmt.Errorf("rackspace: %w", err)
 	}
 
 	// Iterate through the Service Catalog to get the DNS Endpoint
 	var dnsEndpoint string
+
 	for _, service := range identity.Access.ServiceCatalog {
 		if service.Name == "cloudDNS" {
 			dnsEndpoint = service.Endpoints[0].PublicURL
@@ -105,8 +111,20 @@ func NewDNSProviderConfig(config *Config) (*DNSProvider, error) {
 		return nil, errors.New("rackspace: failed to populate DNS endpoint, check Rackspace API for changes")
 	}
 
+	client, err := internal.NewClient(dnsEndpoint, identity.Access.Token.ID)
+	if err != nil {
+		return nil, fmt.Errorf("rackspace: %w", err)
+	}
+
+	if config.HTTPClient != nil {
+		client.HTTPClient = config.HTTPClient
+	}
+
+	client.HTTPClient = clientdebug.Wrap(client.HTTPClient)
+
 	return &DNSProvider{
 		config:           config,
+		client:           client,
 		token:            identity.Access.Token.ID,
 		cloudDNSEndpoint: dnsEndpoint,
 	}, nil
@@ -114,52 +132,51 @@ func NewDNSProviderConfig(config *Config) (*DNSProvider, error) {
 
 // Present creates a TXT record to fulfill the dns-01 challenge.
 func (d *DNSProvider) Present(domain, token, keyAuth string) error {
-	fqdn, value := dns01.GetRecord(domain, keyAuth)
+	info := dns01.GetChallengeInfo(domain, keyAuth)
 
-	zoneID, err := d.getHostedZoneID(fqdn)
+	ctx := context.Background()
+
+	zoneID, err := d.client.GetHostedZoneID(ctx, info.EffectiveFQDN)
 	if err != nil {
 		return fmt.Errorf("rackspace: %w", err)
 	}
 
-	rec := Records{
-		Record: []Record{{
-			Name: dns01.UnFqdn(fqdn),
-			Type: "TXT",
-			Data: value,
-			TTL:  d.config.TTL,
-		}},
+	record := internal.Record{
+		Name: dns01.UnFqdn(info.EffectiveFQDN),
+		Type: "TXT",
+		Data: info.Value,
+		TTL:  d.config.TTL,
 	}
 
-	body, err := json.Marshal(rec)
+	err = d.client.AddRecord(ctx, zoneID, record)
 	if err != nil {
 		return fmt.Errorf("rackspace: %w", err)
 	}
 
-	_, err = d.makeRequest(http.MethodPost, fmt.Sprintf("/domains/%d/records", zoneID), bytes.NewReader(body))
-	if err != nil {
-		return fmt.Errorf("rackspace: %w", err)
-	}
 	return nil
 }
 
 // CleanUp removes the TXT record matching the specified parameters.
 func (d *DNSProvider) CleanUp(domain, token, keyAuth string) error {
-	fqdn, _ := dns01.GetRecord(domain, keyAuth)
+	info := dns01.GetChallengeInfo(domain, keyAuth)
 
-	zoneID, err := d.getHostedZoneID(fqdn)
+	ctx := context.Background()
+
+	zoneID, err := d.client.GetHostedZoneID(ctx, info.EffectiveFQDN)
 	if err != nil {
 		return fmt.Errorf("rackspace: %w", err)
 	}
 
-	record, err := d.findTxtRecord(fqdn, zoneID)
+	record, err := d.client.FindTxtRecord(ctx, info.EffectiveFQDN, zoneID)
 	if err != nil {
 		return fmt.Errorf("rackspace: %w", err)
 	}
 
-	_, err = d.makeRequest(http.MethodDelete, fmt.Sprintf("/domains/%d/records?id=%s", zoneID, record.ID), nil)
+	err = d.client.DeleteRecord(ctx, zoneID, record.ID)
 	if err != nil {
 		return fmt.Errorf("rackspace: %w", err)
 	}
+
 	return nil
 }
 

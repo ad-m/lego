@@ -3,25 +3,30 @@ title: "External program"
 date: 2019-03-03T16:39:46+01:00
 draft: false
 slug: exec
+dnsprovider:
+  since:    "v0.5.0"
+  code:     "exec"
+  url:      "/dns/exec"
 ---
 
 <!-- THIS DOCUMENTATION IS AUTO-GENERATED. PLEASE DO NOT EDIT. -->
 <!-- providers/dns/exec/exec.toml -->
 <!-- THIS DOCUMENTATION IS AUTO-GENERATED. PLEASE DO NOT EDIT. -->
 
-Since: v0.5.0
 Solving the DNS-01 challenge using an external program.
 
 
 <!--more-->
 
 - Code: `exec`
+- Since: v0.5.0
+
 
 Here is an example bash command using the External program provider:
 
 ```bash
 EXEC_PATH=/the/path/to/myscript.sh \
-lego --email myemail@example.com --dns exec --domains my.example.org run
+lego --dns exec -d '*.example.com' -d example.com run
 ```
 
 
@@ -38,10 +43,11 @@ lego --email myemail@example.com --dns exec --domains my.example.org run
 
 ## Additional Configuration
 
-| Environment Variable Name  | Description                               |
-|----------------------------|-------------------------------------------|
-| `EXEC_POLLING_INTERVAL`    | Time between DNS propagation check.       |
-| `EXEC_PROPAGATION_TIMEOUT` | Maximum waiting time for DNS propagation. |
+| Environment Variable Name  | Description                                                        |
+|----------------------------|--------------------------------------------------------------------|
+| `EXEC_POLLING_INTERVAL`    | Time between DNS propagation check in seconds (Default: 3).        |
+| `EXEC_PROPAGATION_TIMEOUT` | Maximum waiting time for DNS propagation in seconds (Default: 60). |
+| `EXEC_SEQUENCE_INTERVAL`   | Time between sequential requests in seconds (Default: 60).         |
 
 
 ## Description
@@ -55,9 +61,7 @@ For example, requesting a certificate for the domain 'my.example.org' can be ach
 
 ```bash
 EXEC_PATH=./update-dns.sh \
-	lego --email myemail@example.com \
-	--dns exec \
-	--domains my.example.org run
+lego --dns exec --d my.example.org run
 ```
 
 It will then call the program './update-dns.sh' with like this:
@@ -77,15 +81,13 @@ If you want to use the raw domain, token, and keyAuth values with your program, 
 ```bash
 EXEC_MODE=RAW \
 EXEC_PATH=./update-dns.sh \
-	lego --email myemail@example.com \
-	--dns exec \
-	--domains my.example.org run
+lego --dns exec -d my.example.org run
 ```
 
 It will then call the program `./update-dns.sh` like this:
 
 ```bash
-./update-dns.sh "present" "my.example.org." "--" "some-token" "KxAy-J3NwUmg9ZQuM-gP_Mq1nStaYSaP9tYQs5_-YsE.ksT-qywTd8058G-SHHWA3RAN72Pr0yWtPYmmY5UBpQ8"
+./update-dns.sh "present" "--" "my.example.org." "some-token" "KxAy-J3NwUmg9ZQuM-gP_Mq1nStaYSaP9tYQs5_-YsE.ksT-qywTd8058G-SHHWA3RAN72Pr0yWtPYmmY5UBpQ8"
 ```
 
 ## Commands
@@ -100,30 +102,15 @@ you can use the `--` delimiter to specify the start of positional arguments, and
 
 | Mode    | Command                                            |
 |---------|----------------------------------------------------|
-| default | `myprogram present -- <FQDN> <record>`             |
+| default | `myprogram present <FQDN> <record>`                |
 | `RAW`   | `myprogram present -- <domain> <token> <key_auth>` |
 
 ### Cleanup
 
 | Mode    | Command                                            |
 |---------|----------------------------------------------------|
-| default | `myprogram cleanup -- <FQDN> <record>`             |
+| default | `myprogram cleanup <FQDN> <record>`                |
 | `RAW`   | `myprogram cleanup -- <domain> <token> <key_auth>` |
-
-### Timeout
-
-The command have to display propagation timeout and polling interval into Stdout.
-
-The values must be formatted as JSON, and times are in seconds.
-Example: `{"timeout": 30, "interval": 5}`
-
-If an error occurs or if the command is not provided:
-the default display propagation timeout and polling interval are used.
-
-| Mode    | Command                                            |
-|---------|----------------------------------------------------|
-| default | `myprogram timeout`                                |
-| `RAW`   | `myprogram timeout`                                |
 
 
 

@@ -15,7 +15,7 @@ For example, the HTTP-01 challenge doesn't work well behind a load balancer or C
 
 But even if using HTTP-01 or TLS-ALPN-01 challenges, you may have specific needs that lego does not consider by default.
 
-You can write something called a `challenge.Provider` that implements [this interface](https://godoc.org/github.com/go-acme/lego/challenge#Provider):
+You can write something called a `challenge.Provider` that implements [this interface](https://pkg.go.dev/github.com/go-acme/lego/v4/challenge#Provider):
 
 ```go
 type Provider interface {
@@ -59,15 +59,16 @@ For DNS-01, we'll just use `domain` and `keyAuth`.
 
 ```go
 func (d *DNSProviderBestDNS) Present(domain, token, keyAuth string) error {
-    fqdn, value := dns01.GetRecord(domain, keyAuth)
+    info := dns01.GetChallengeInfo(domain, keyAuth)
     // make API request to set a TXT record on fqdn with value and TTL
     return nil
 }
 ```
 
-After calling `dns01.GetRecord(domain, keyAuth)`, we now have the information we need to make our API request and set the TXT record:
-- `fqdn` is the fully qualified domain name on which to set the TXT record.
-- `value` is the record's value to set on the record.
+After calling `dns01.GetChallengeInfo(domain, keyAuth)`, we now have the information we need to make our API request and set the TXT record:
+- `FQDN` is the fully qualified domain name on which to set the TXT record.
+- `EffectiveFQDN` is the fully qualified domain name after the CNAMEs resolutions on which to set the TXT record.
+- `Value` is the record's value to set on the record.
 
 So then you make an API request to the DNS service according to their docs.
 Once the TXT record is set on the domain, you may return and the challenge will proceed.
@@ -85,7 +86,7 @@ In our case, we'd just make another API request to have the DNS record deleted; 
 
 ## Using your new challenge.Provider
 
-To use your new challenge provider, call [`client.Challenge.SetDNS01Provider`](https://godoc.org/github.com/go-acme/lego/challenge/resolver#SolverManager.SetDNS01Provider) to tell lego, "For this challenge, use this provider".
+To use your new challenge provider, call [`client.Challenge.SetDNS01Provider`](https://pkg.go.dev/github.com/go-acme/lego/v4/challenge/resolver#SolverManager.SetDNS01Provider) to tell lego, "For this challenge, use this provider".
 In our case:
 
 ```go

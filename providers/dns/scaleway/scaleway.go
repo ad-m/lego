@@ -1,5 +1,4 @@
 // Package scaleway implements a DNS provider for solving the DNS-01 challenge using Scaleway Domains API.
-// Scaleway Domain API reference: https://developers.scaleway.com/en/products/domain/api/
 // Token: https://www.scaleway.com/en/docs/generate-an-api-token/
 package scaleway
 
@@ -7,28 +6,30 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
+	"strings"
 	"time"
 
+	"github.com/go-acme/lego/v4/challenge"
 	"github.com/go-acme/lego/v4/challenge/dns01"
 	"github.com/go-acme/lego/v4/platform/config/env"
-	"github.com/go-acme/lego/v4/providers/dns/scaleway/internal"
-)
-
-const (
-	defaultBaseURL            = "https://api.scaleway.com"
-	defaultVersion            = "v2alpha2"
-	minTTL                    = 60
-	defaultPollingInterval    = 10 * time.Second
-	defaultPropagationTimeout = 120 * time.Second
+	"github.com/go-acme/lego/v4/providers/dns/internal/clientdebug"
+	"github.com/go-acme/lego/v4/providers/dns/internal/useragent"
+	scwdomain "github.com/scaleway/scaleway-sdk-go/api/domain/v2beta1"
+	"github.com/scaleway/scaleway-sdk-go/scw"
 )
 
 // Environment variables names.
 const (
 	envNamespace = "SCALEWAY_"
 
-	EnvBaseURL    = envNamespace + "BASE_URL"
-	EnvAPIToken   = envNamespace + "API_TOKEN"
-	EnvAPIVersion = envNamespace + "API_VERSION"
+	EnvAPIToken  = envNamespace + "API_TOKEN"
+	EnvProjectID = envNamespace + "PROJECT_ID"
+
+	altEnvNamespace = "SCW_"
+
+	EnvAccessKey = altEnvNamespace + "ACCESS_KEY"
+	EnvSecretKey = altEnvNamespace + "SECRET_KEY"
 
 	EnvTTL                = envNamespace + "TTL"
 	EnvPropagationTimeout = envNamespace + "PROPAGATION_TIMEOUT"
@@ -36,11 +37,23 @@ const (
 	EnvHTTPTimeout        = envNamespace + "HTTP_TIMEOUT"
 )
 
+const (
+	minTTL                    = 60
+	defaultPollingInterval    = 10 * time.Second
+	defaultPropagationTimeout = 120 * time.Second
+)
+
+// The access key is not used by the Scaleway client.
+const dumpAccessKey = "SCWXXXXXXXXXXXXXXXXX"
+
+var _ challenge.ProviderTimeout = (*DNSProvider)(nil)
+
 // Config is used to configure the creation of the DNSProvider.
 type Config struct {
-	BaseURL            string
-	Version            string
-	Token              string
+	ProjectID string
+	Token     string // TODO(ldez) rename to SecretKey in the next major.
+	AccessKey string
+
 	PropagationTimeout time.Duration
 	PollingInterval    time.Duration
 	TTL                int
@@ -50,11 +63,10 @@ type Config struct {
 // NewDefaultConfig returns a default configuration for the DNSProvider.
 func NewDefaultConfig() *Config {
 	return &Config{
-		BaseURL:            env.GetOrDefaultString(EnvBaseURL, defaultBaseURL),
-		Version:            env.GetOrDefaultString(EnvAPIVersion, defaultVersion),
-		TTL:                env.GetOrDefaultInt(EnvTTL, minTTL),
-		PropagationTimeout: env.GetOrDefaultSecond(EnvPropagationTimeout, defaultPropagationTimeout),
-		PollingInterval:    env.GetOrDefaultSecond(EnvPollingInterval, defaultPollingInterval),
+		AccessKey:          dumpAccessKey,
+		TTL:                env.GetOneWithFallback(EnvTTL, minTTL, strconv.Atoi, altEnvName(EnvTTL)),
+		PropagationTimeout: env.GetOneWithFallback(EnvPropagationTimeout, defaultPropagationTimeout, env.ParseSecond, altEnvName(EnvPropagationTimeout)),
+		PollingInterval:    env.GetOneWithFallback(EnvPollingInterval, defaultPollingInterval, env.ParseSecond, altEnvName(EnvPollingInterval)),
 		HTTPClient: &http.Client{
 			Timeout: env.GetOrDefaultSecond(EnvHTTPTimeout, 30*time.Second),
 		},
@@ -64,19 +76,22 @@ func NewDefaultConfig() *Config {
 // DNSProvider implements the challenge.Provider interface.
 type DNSProvider struct {
 	config *Config
-	client *internal.Client
+	client *scwdomain.API
 }
 
 // NewDNSProvider returns a DNSProvider instance configured for Scaleway Domains API.
-// API token must be passed in the environment variable SCALEWAY_API_TOKEN.
+// Credentials must be passed in the environment variables:
+// SCALEWAY_API_TOKEN, SCALEWAY_PROJECT_ID.
 func NewDNSProvider() (*DNSProvider, error) {
-	values, err := env.Get(EnvAPIToken)
+	values, err := env.GetWithFallback([]string{EnvSecretKey, EnvAPIToken})
 	if err != nil {
 		return nil, fmt.Errorf("scaleway: %w", err)
 	}
 
 	config := NewDefaultConfig()
-	config.Token = values[EnvAPIToken]
+	config.Token = values[EnvSecretKey]
+	config.AccessKey = env.GetOrDefaultString(EnvAccessKey, dumpAccessKey)
+	config.ProjectID = env.GetOrFile(EnvProjectID)
 
 	return NewDNSProviderConfig(config)
 }
@@ -95,12 +110,26 @@ func NewDNSProviderConfig(config *Config) (*DNSProvider, error) {
 		config.TTL = minTTL
 	}
 
-	client := internal.NewClient(internal.ClientOpts{
-		BaseURL: fmt.Sprintf("%s/domain/%s", config.BaseURL, config.Version),
-		Token:   config.Token,
-	}, config.HTTPClient)
+	configuration := []scw.ClientOption{
+		scw.WithAuth(config.AccessKey, config.Token),
+		scw.WithUserAgent(useragent.Get()),
+	}
 
-	return &DNSProvider{config: config, client: client}, nil
+	if config.HTTPClient != nil {
+		configuration = append(configuration, scw.WithHTTPClient(clientdebug.Wrap(config.HTTPClient)))
+	}
+
+	if config.ProjectID != "" {
+		configuration = append(configuration, scw.WithDefaultProjectID(config.ProjectID))
+	}
+
+	// Create a Scaleway client
+	clientScw, err := scw.NewClient(configuration...)
+	if err != nil {
+		return nil, fmt.Errorf("scaleway: %w", err)
+	}
+
+	return &DNSProvider{config: config, client: scwdomain.NewAPI(clientScw)}, nil
 }
 
 // Timeout returns the Timeout and interval to use when checking for DNS propagation.
@@ -111,36 +140,60 @@ func (d *DNSProvider) Timeout() (timeout, interval time.Duration) {
 
 // Present creates a TXT record to fulfill DNS-01 challenge.
 func (d *DNSProvider) Present(domain, token, keyAuth string) error {
-	fqdn, value := dns01.GetRecord(domain, keyAuth)
+	info := dns01.GetChallengeInfo(domain, keyAuth)
 
-	txtRecord := internal.Record{
-		Type: "TXT",
-		TTL:  uint32(d.config.TTL),
-		Name: fqdn,
-		Data: fmt.Sprintf(`"%s"`, value),
+	records := []*scwdomain.Record{{
+		Data:    fmt.Sprintf(`%q`, info.Value),
+		Name:    info.EffectiveFQDN,
+		TTL:     uint32(d.config.TTL),
+		Type:    scwdomain.RecordTypeTXT,
+		Comment: scw.StringPtr("used by lego"),
+	}}
+
+	req := &scwdomain.UpdateDNSZoneRecordsRequest{
+		DNSZone: info.EffectiveFQDN,
+		Changes: []*scwdomain.RecordChange{{
+			Add: &scwdomain.RecordChangeAdd{Records: records},
+		}},
+		ReturnAllRecords:        scw.BoolPtr(false),
+		DisallowNewZoneCreation: true,
 	}
 
-	err := d.client.AddRecord(domain, txtRecord)
+	_, err := d.client.UpdateDNSZoneRecords(req)
 	if err != nil {
 		return fmt.Errorf("scaleway: %w", err)
 	}
+
 	return nil
 }
 
 // CleanUp removes a TXT record used for DNS-01 challenge.
 func (d *DNSProvider) CleanUp(domain, token, keyAuth string) error {
-	fqdn, value := dns01.GetRecord(domain, keyAuth)
+	info := dns01.GetChallengeInfo(domain, keyAuth)
 
-	txtRecord := internal.Record{
-		Type: "TXT",
-		TTL:  uint32(d.config.TTL),
-		Name: fqdn,
-		Data: fmt.Sprintf(`"%s"`, value),
+	recordIdentifier := &scwdomain.RecordIdentifier{
+		Name: info.EffectiveFQDN,
+		Type: scwdomain.RecordTypeTXT,
+		Data: scw.StringPtr(fmt.Sprintf(`%q`, info.Value)),
 	}
 
-	err := d.client.DeleteRecord(domain, txtRecord)
+	req := &scwdomain.UpdateDNSZoneRecordsRequest{
+		DNSZone: info.EffectiveFQDN,
+		Changes: []*scwdomain.RecordChange{{
+			Delete: &scwdomain.RecordChangeDelete{IDFields: recordIdentifier},
+		}},
+		ReturnAllRecords:        scw.BoolPtr(false),
+		DisallowNewZoneCreation: true,
+	}
+
+	_, err := d.client.UpdateDNSZoneRecords(req)
 	if err != nil {
 		return fmt.Errorf("scaleway: %w", err)
 	}
+
 	return nil
+}
+
+func altEnvName(v string) string {
+	return strings.ReplaceAll(v, envNamespace, altEnvNamespace)
 }

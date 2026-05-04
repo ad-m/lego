@@ -3,13 +3,15 @@ title: "Akamai EdgeDNS"
 date: 2019-03-03T16:39:46+01:00
 draft: false
 slug: edgedns
+dnsprovider:
+  since:    "v3.9.0"
+  code:     "edgedns"
+  url:      "https://www.akamai.com/us/en/products/security/edge-dns.jsp"
 ---
 
 <!-- THIS DOCUMENTATION IS AUTO-GENERATED. PLEASE DO NOT EDIT. -->
 <!-- providers/dns/edgedns/edgedns.toml -->
 <!-- THIS DOCUMENTATION IS AUTO-GENERATED. PLEASE DO NOT EDIT. -->
-
-Since: v3.9.0
 
 Akamai edgedns supersedes FastDNS; implementing a DNS provider for solving the DNS-01 challenge using Akamai EdgeDNS
 
@@ -18,6 +20,8 @@ Akamai edgedns supersedes FastDNS; implementing a DNS provider for solving the D
 <!--more-->
 
 - Code: `edgedns`
+- Since: v3.9.0
+
 
 Here is an example bash command using the Akamai EdgeDNS provider:
 
@@ -26,7 +30,7 @@ AKAMAI_CLIENT_SECRET=abcdefghijklmnopqrstuvwxyz1234567890ABCDEFG= \
 AKAMAI_CLIENT_TOKEN=akab-mnbvcxzlkjhgfdsapoiuytrewq1234567 \
 AKAMAI_HOST=akab-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.luna.akamaiapis.net \
 AKAMAI_ACCESS_TOKEN=akab-1234567890qwerty-asdfghjklzxcvtnu \
-lego --email myemail@example.com --dns edgedns --domains my.example.org run
+lego --dns edgedns -d '*.example.com' -d example.com run
 ```
 
 
@@ -44,21 +48,22 @@ lego --email myemail@example.com --dns edgedns --domains my.example.org run
 | `AKAMAI_HOST` | API host, managed by the Akamai EdgeGrid client |
 
 The environment variable names can be suffixed by `_FILE` to reference a file instead of a value.
-More information [here](/lego/dns/#configuration-and-credentials).
+More information [here]({{% ref "dns#configuration-and-credentials" %}}).
 
 
 ## Additional Configuration
 
 | Environment Variable Name | Description |
 |--------------------------------|-------------|
-| `AKAMAI_POLLING_INTERVAL` | Time between DNS propagation check. Default: 15 seconds |
-| `AKAMAI_PROPAGATION_TIMEOUT` | Maximum waiting time for DNS propagation. Default: 3 minutes |
-| `AKAMAI_TTL` | The TTL of the TXT record used for the DNS challenge |
+| `AKAMAI_ACCOUNT_SWITCH_KEY` | Target account ID when the DNS zone and credentials belong to different accounts |
+| `AKAMAI_POLLING_INTERVAL` | Time between DNS propagation check in seconds (Default: 15) |
+| `AKAMAI_PROPAGATION_TIMEOUT` | Maximum waiting time for DNS propagation in seconds (Default: 180) |
+| `AKAMAI_TTL` | The TTL of the TXT record used for the DNS challenge in seconds (Default: 120) |
 
 The environment variable names can be suffixed by `_FILE` to reference a file instead of a value.
-More information [here](/lego/dns/#configuration-and-credentials).
+More information [here]({{% ref "dns#configuration-and-credentials" %}}).
 
-Akamai credentials are automatically detected in the following locations and prioritized in the following order:
+Akamai's credentials are automatically detected in the following locations and prioritized in the following order:
 
 1. Section-specific environment variables (where `{SECTION}` is specified using `AKAMAI_EDGERC_SECTION`):
   - `AKAMAI_{SECTION}_HOST`
@@ -83,7 +88,8 @@ See also:
 - [Setting up Akamai credentials](https://developer.akamai.com/api/getting-started)
 - [.edgerc Format](https://developer.akamai.com/legacy/introduction/Conf_Client.html#edgercformat)
 - [API Client Authentication](https://developer.akamai.com/legacy/introduction/Client_Auth.html)
-- [Config from Env](https://github.com/akamai/AkamaiOPEN-edgegrid-golang/blob/master/edgegrid/config.go#L118)
+- [Config from Env](https://github.com/akamai/AkamaiOPEN-edgegrid-golang/blob/master/pkg/edgegrid/config.go#L118)
+- [Manage many accounts](https://techdocs.akamai.com/developer/docs/manage-many-accounts-with-one-api-client)
 
 
 

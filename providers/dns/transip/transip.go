@@ -4,9 +4,10 @@ package transip
 import (
 	"errors"
 	"fmt"
-	"strings"
+	"net/http"
 	"time"
 
+	"github.com/go-acme/lego/v4/challenge"
 	"github.com/go-acme/lego/v4/challenge/dns01"
 	"github.com/go-acme/lego/v4/platform/config/env"
 	"github.com/transip/gotransip/v6"
@@ -23,7 +24,10 @@ const (
 	EnvTTL                = envNamespace + "TTL"
 	EnvPropagationTimeout = envNamespace + "PROPAGATION_TIMEOUT"
 	EnvPollingInterval    = envNamespace + "POLLING_INTERVAL"
+	EnvHTTPTimeout        = envNamespace + "HTTP_TIMEOUT"
 )
+
+var _ challenge.ProviderTimeout = (*DNSProvider)(nil)
 
 // Config is used to configure the creation of the DNSProvider.
 type Config struct {
@@ -32,6 +36,7 @@ type Config struct {
 	PropagationTimeout time.Duration
 	PollingInterval    time.Duration
 	TTL                int64
+	HTTPClient         *http.Client
 }
 
 // NewDefaultConfig returns a default configuration for the DNSProvider.
@@ -40,6 +45,9 @@ func NewDefaultConfig() *Config {
 		TTL:                int64(env.GetOrDefaultInt(EnvTTL, 10)),
 		PropagationTimeout: env.GetOrDefaultSecond(EnvPropagationTimeout, 10*time.Minute),
 		PollingInterval:    env.GetOrDefaultSecond(EnvPollingInterval, 10*time.Second),
+		HTTPClient: &http.Client{
+			Timeout: env.GetOrDefaultSecond(EnvHTTPTimeout, 30*time.Second),
+		},
 	}
 }
 
@@ -71,10 +79,19 @@ func NewDNSProviderConfig(config *Config) (*DNSProvider, error) {
 		return nil, errors.New("transip: the configuration of the DNS provider is nil")
 	}
 
-	client, err := gotransip.NewClient(gotransip.ClientConfiguration{
+	cfg := gotransip.ClientConfiguration{
 		AccountName:    config.AccountName,
 		PrivateKeyPath: config.PrivateKeyPath,
-	})
+	}
+
+	if config.HTTPClient != nil {
+		cfg.HTTPClient = config.HTTPClient
+	} else {
+		// Uses an explicit default HTTP client because the desec.NewDefaultClientOptions uses the http.DefaultClient.
+		cfg.HTTPClient = &http.Client{Timeout: 30 * time.Second}
+	}
+
+	client, err := gotransip.NewClient(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("transip: %w", err)
 	}
@@ -92,23 +109,26 @@ func (d *DNSProvider) Timeout() (timeout, interval time.Duration) {
 
 // Present creates a TXT record to fulfill the dns-01 challenge.
 func (d *DNSProvider) Present(domain, token, keyAuth string) error {
-	fqdn, value := dns01.GetRecord(domain, keyAuth)
+	info := dns01.GetChallengeInfo(domain, keyAuth)
 
-	authZone, err := dns01.FindZoneByFqdn(fqdn)
+	authZone, err := dns01.FindZoneByFqdn(info.EffectiveFQDN)
 	if err != nil {
-		return err
+		return fmt.Errorf("transip: could not find zone for domain %q: %w", domain, err)
+	}
+
+	// get the subDomain
+	subDomain, err := dns01.ExtractSubDomain(info.EffectiveFQDN, authZone)
+	if err != nil {
+		return fmt.Errorf("transip: %w", err)
 	}
 
 	domainName := dns01.UnFqdn(authZone)
-
-	// get the subDomain
-	subDomain := strings.TrimSuffix(dns01.UnFqdn(fqdn), "."+domainName)
 
 	entry := transipdomain.DNSEntry{
 		Name:    subDomain,
 		Expire:  int(d.config.TTL),
 		Type:    "TXT",
-		Content: value,
+		Content: info.Value,
 	}
 
 	err = d.repository.AddDNSEntry(domainName, entry)
@@ -121,30 +141,34 @@ func (d *DNSProvider) Present(domain, token, keyAuth string) error {
 
 // CleanUp removes the TXT record matching the specified parameters.
 func (d *DNSProvider) CleanUp(domain, token, keyAuth string) error {
-	fqdn, value := dns01.GetRecord(domain, keyAuth)
+	info := dns01.GetChallengeInfo(domain, keyAuth)
 
-	authZone, err := dns01.FindZoneByFqdn(fqdn)
+	authZone, err := dns01.FindZoneByFqdn(info.EffectiveFQDN)
 	if err != nil {
-		return err
+		return fmt.Errorf("transip: could not find zone for domain %q: %w", domain, err)
+	}
+
+	// get the subDomain
+	subDomain, err := dns01.ExtractSubDomain(info.EffectiveFQDN, authZone)
+	if err != nil {
+		return fmt.Errorf("transip: %w", err)
 	}
 
 	domainName := dns01.UnFqdn(authZone)
 
-	// get the subDomain
-	subDomain := strings.TrimSuffix(dns01.UnFqdn(fqdn), "."+domainName)
-
 	// get all DNS entries
 	dnsEntries, err := d.repository.GetDNSEntries(domainName)
 	if err != nil {
-		return fmt.Errorf("transip: error for %s in CleanUp: %w", fqdn, err)
+		return fmt.Errorf("transip: error for %s in CleanUp: %w", info.EffectiveFQDN, err)
 	}
 
 	// loop through the existing entries and remove the specific record
 	for _, entry := range dnsEntries {
-		if entry.Name == subDomain && entry.Content == value {
+		if entry.Name == subDomain && entry.Content == info.Value {
 			if err = d.repository.RemoveDNSEntry(domainName, entry); err != nil {
 				return fmt.Errorf("transip: couldn't get Record ID in CleanUp: %w", err)
 			}
+
 			return nil
 		}
 	}

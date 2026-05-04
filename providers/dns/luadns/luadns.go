@@ -2,6 +2,7 @@
 package luadns
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
@@ -9,12 +10,12 @@ import (
 	"sync"
 	"time"
 
+	"github.com/go-acme/lego/v4/challenge"
 	"github.com/go-acme/lego/v4/challenge/dns01"
 	"github.com/go-acme/lego/v4/platform/config/env"
+	"github.com/go-acme/lego/v4/providers/dns/internal/clientdebug"
 	"github.com/go-acme/lego/v4/providers/dns/luadns/internal"
 )
-
-const minTTL = 300
 
 // Environment variables names.
 const (
@@ -28,6 +29,10 @@ const (
 	EnvPollingInterval    = envNamespace + "POLLING_INTERVAL"
 	EnvHTTPTimeout        = envNamespace + "HTTP_TIMEOUT"
 )
+
+const minTTL = 300
+
+var _ challenge.ProviderTimeout = (*DNSProvider)(nil)
 
 // Config is used to configure the creation of the DNSProvider.
 type Config struct {
@@ -44,7 +49,7 @@ func NewDefaultConfig() *Config {
 	return &Config{
 		TTL:                env.GetOrDefaultInt(EnvTTL, minTTL),
 		PropagationTimeout: env.GetOrDefaultSecond(EnvPropagationTimeout, 120*time.Second),
-		PollingInterval:    env.GetOrDefaultSecond(EnvPollingInterval, 2*time.Second),
+		PollingInterval:    env.GetOrDefaultSecond(EnvPollingInterval, dns01.DefaultPollingInterval),
 		HTTPClient: &http.Client{
 			Timeout: env.GetOrDefaultSecond(EnvHTTPTimeout, 30*time.Second),
 		},
@@ -96,11 +101,12 @@ func NewDNSProviderConfig(config *Config) (*DNSProvider, error) {
 		client.HTTPClient = config.HTTPClient
 	}
 
+	client.HTTPClient = clientdebug.Wrap(client.HTTPClient)
+
 	return &DNSProvider{
-		config:    config,
-		client:    client,
-		recordsMu: sync.Mutex{},
-		records:   make(map[string]*internal.DNSRecord),
+		config:  config,
+		client:  client,
+		records: make(map[string]*internal.DNSRecord),
 	}, nil
 }
 
@@ -112,26 +118,33 @@ func (d *DNSProvider) Timeout() (timeout, interval time.Duration) {
 
 // Present creates a TXT record using the specified parameters.
 func (d *DNSProvider) Present(domain, token, keyAuth string) error {
-	fqdn, value := dns01.GetRecord(domain, keyAuth)
+	info := dns01.GetChallengeInfo(domain, keyAuth)
 
-	zones, err := d.client.ListZones()
+	ctx := context.Background()
+
+	zones, err := d.client.ListZones(ctx)
 	if err != nil {
 		return fmt.Errorf("luadns: failed to get zones: %w", err)
 	}
 
-	zone := findZone(zones, domain)
+	authZone, err := dns01.FindZoneByFqdn(info.EffectiveFQDN)
+	if err != nil {
+		return fmt.Errorf("luadns: could not find zone for domain %q: %w", domain, err)
+	}
+
+	zone := findZone(zones, dns01.UnFqdn(authZone))
 	if zone == nil {
 		return fmt.Errorf("luadns: no matching zone found for domain %s", domain)
 	}
 
 	newRecord := internal.DNSRecord{
-		Name:    fqdn,
+		Name:    info.EffectiveFQDN,
 		Type:    "TXT",
-		Content: value,
+		Content: info.Value,
 		TTL:     d.config.TTL,
 	}
 
-	record, err := d.client.CreateRecord(*zone, newRecord)
+	record, err := d.client.CreateRecord(ctx, *zone, newRecord)
 	if err != nil {
 		return fmt.Errorf("luadns: failed to create record: %w", err)
 	}
@@ -145,17 +158,17 @@ func (d *DNSProvider) Present(domain, token, keyAuth string) error {
 
 // CleanUp removes the TXT record matching the specified parameters.
 func (d *DNSProvider) CleanUp(domain, token, keyAuth string) error {
-	fqdn, _ := dns01.GetRecord(domain, keyAuth)
+	info := dns01.GetChallengeInfo(domain, keyAuth)
 
 	d.recordsMu.Lock()
 	record, ok := d.records[token]
 	d.recordsMu.Unlock()
 
 	if !ok {
-		return fmt.Errorf("luadns: unknown record ID for '%s'", fqdn)
+		return fmt.Errorf("luadns: unknown record ID for '%s'", info.EffectiveFQDN)
 	}
 
-	err := d.client.DeleteRecord(record)
+	err := d.client.DeleteRecord(context.Background(), record)
 	if err != nil {
 		return fmt.Errorf("luadns: failed to delete record: %w", err)
 	}
@@ -172,7 +185,6 @@ func findZone(zones []internal.DNSZone, domain string) *internal.DNSZone {
 	var result *internal.DNSZone
 
 	for _, zone := range zones {
-		zone := zone
 		if zone.Name != "" && strings.HasSuffix(domain, zone.Name) {
 			if result == nil || len(zone.Name) > len(result.Name) {
 				result = &zone

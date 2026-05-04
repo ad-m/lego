@@ -2,6 +2,8 @@ package http01
 
 import (
 	"fmt"
+	"path"
+	"time"
 
 	"github.com/go-acme/lego/v4/acme"
 	"github.com/go-acme/lego/v4/acme/api"
@@ -9,25 +11,51 @@ import (
 	"github.com/go-acme/lego/v4/log"
 )
 
+const PathPrefix = "/.well-known/acme-challenge/"
+
 type ValidateFunc func(core *api.Core, domain string, chlng acme.Challenge) error
+
+type ChallengeOption func(*Challenge) error
+
+// SetDelay sets a delay between the start of the HTTP server and the challenge validation.
+func SetDelay(delay time.Duration) ChallengeOption {
+	return func(chlg *Challenge) error {
+		chlg.delay = delay
+		return nil
+	}
+}
 
 // ChallengePath returns the URL path for the `http-01` challenge.
 func ChallengePath(token string) string {
-	return "/.well-known/acme-challenge/" + token
+	if isBase64url(token) {
+		return PathPrefix + token
+	}
+
+	return path.Join(PathPrefix, "invalid")
 }
 
 type Challenge struct {
 	core     *api.Core
 	validate ValidateFunc
 	provider challenge.Provider
+	delay    time.Duration
 }
 
-func NewChallenge(core *api.Core, validate ValidateFunc, provider challenge.Provider) *Challenge {
-	return &Challenge{
+func NewChallenge(core *api.Core, validate ValidateFunc, provider challenge.Provider, opts ...ChallengeOption) *Challenge {
+	chlg := &Challenge{
 		core:     core,
 		validate: validate,
 		provider: provider,
 	}
+
+	for _, opt := range opts {
+		err := opt(chlg)
+		if err != nil {
+			log.Infof("challenge option error: %v", err)
+		}
+	}
+
+	return chlg
 }
 
 func (c *Challenge) SetProvider(provider challenge.Provider) {
@@ -53,6 +81,7 @@ func (c *Challenge) Solve(authz acme.Authorization) error {
 	if err != nil {
 		return fmt.Errorf("[%s] acme: error presenting token: %w", domain, err)
 	}
+
 	defer func() {
 		err := c.provider.CleanUp(authz.Identifier.Value, chlng.Token, keyAuth)
 		if err != nil {
@@ -60,6 +89,31 @@ func (c *Challenge) Solve(authz acme.Authorization) error {
 		}
 	}()
 
+	if c.delay > 0 {
+		time.Sleep(c.delay)
+	}
+
 	chlng.KeyAuthorization = keyAuth
+
 	return c.validate(c.core, domain, chlng)
+}
+
+// https://en.wikipedia.org/wiki/Base64#Alphabet
+// ^[A-Za-z0-9_-]+$
+// It MUST NOT contain any characters outside the base64url alphabet
+// and MUST NOT include base64 padding characters ("=")
+// https://www.rfc-editor.org/rfc/rfc8555.html#section-8.3
+func isBase64url(s string) bool {
+	for _, c := range s {
+		isUpper := c >= 'A' && c <= 'Z'
+		isLower := c >= 'a' && c <= 'z'
+		isDigit := c >= '0' && c <= '9'
+		isSpecial := c == '-' || c == '_'
+
+		if !isUpper && !isLower && !isDigit && !isSpecial {
+			return false
+		}
+	}
+
+	return true
 }

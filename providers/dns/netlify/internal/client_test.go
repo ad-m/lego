@@ -1,54 +1,35 @@
 package internal
 
 import (
-	"fmt"
-	"io"
 	"net/http"
 	"net/http/httptest"
-	"os"
+	"net/url"
 	"testing"
 
+	"github.com/go-acme/lego/v4/platform/tester/servermock"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
+func setupClient(token string) func(server *httptest.Server) (*Client, error) {
+	return func(server *httptest.Server) (*Client, error) {
+		client := NewClient(OAuthStaticAccessToken(server.Client(), token))
+		client.baseURL, _ = url.Parse(server.URL)
+
+		return client, nil
+	}
+}
+
 func TestClient_GetRecords(t *testing.T) {
-	mux := http.NewServeMux()
-	server := httptest.NewServer(mux)
-	t.Cleanup(server.Close)
+	client := servermock.NewBuilder[*Client](setupClient("tokenA"),
+		servermock.CheckHeader().WithJSONHeaders().
+			WithAuthorization("Bearer tokenA"),
+	).
+		Route("GET /dns_zones/zoneID/dns_records",
+			servermock.ResponseFromFixture("get_records.json")).
+		Build(t)
 
-	mux.HandleFunc("/dns_zones/zoneID/dns_records", func(rw http.ResponseWriter, req *http.Request) {
-		if req.Method != http.MethodGet {
-			http.Error(rw, "unsupported method", http.StatusMethodNotAllowed)
-			return
-		}
-
-		auth := req.Header.Get("Authorization")
-		if auth != "Bearer tokenA" {
-			http.Error(rw, fmt.Sprintf("invali token: %s", auth), http.StatusUnauthorized)
-			return
-		}
-
-		rw.Header().Set("Content-Type", "application/json; charset=utf-8")
-
-		file, err := os.Open("./fixtures/get_records.json")
-		if err != nil {
-			http.Error(rw, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		defer func() { _ = file.Close() }()
-
-		_, err = io.Copy(rw, file)
-		if err != nil {
-			http.Error(rw, err.Error(), http.StatusInternalServerError)
-			return
-		}
-	})
-
-	client := NewClient("tokenA")
-	client.BaseURL = server.URL
-
-	records, err := client.GetRecords("zoneID")
+	records, err := client.GetRecords(t.Context(), "zoneID")
 	require.NoError(t, err)
 
 	expected := []DNSRecord{
@@ -60,41 +41,16 @@ func TestClient_GetRecords(t *testing.T) {
 }
 
 func TestClient_CreateRecord(t *testing.T) {
-	mux := http.NewServeMux()
-	server := httptest.NewServer(mux)
-	t.Cleanup(server.Close)
-
-	mux.HandleFunc("/dns_zones/zoneID/dns_records", func(rw http.ResponseWriter, req *http.Request) {
-		if req.Method != http.MethodPost {
-			http.Error(rw, "unsupported method", http.StatusMethodNotAllowed)
-			return
-		}
-
-		auth := req.Header.Get("Authorization")
-		if auth != "Bearer tokenB" {
-			http.Error(rw, fmt.Sprintf("invali token: %s", auth), http.StatusUnauthorized)
-			return
-		}
-
-		rw.Header().Set("Content-Type", "application/json; charset=utf-8")
-		rw.WriteHeader(http.StatusCreated)
-
-		file, err := os.Open("./fixtures/create_record.json")
-		if err != nil {
-			http.Error(rw, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		defer func() { _ = file.Close() }()
-
-		_, err = io.Copy(rw, file)
-		if err != nil {
-			http.Error(rw, err.Error(), http.StatusInternalServerError)
-			return
-		}
-	})
-
-	client := NewClient("tokenB")
-	client.BaseURL = server.URL
+	client := servermock.NewBuilder[*Client](setupClient("tokenB"),
+		servermock.CheckHeader().
+			WithAccept("application/json").
+			WithContentType("application/json; charset=utf-8").
+			WithAuthorization("Bearer tokenB"),
+	).
+		Route("POST /dns_zones/zoneID/dns_records",
+			servermock.ResponseFromFixture("create_record.json").
+				WithStatusCode(http.StatusCreated)).
+		Build(t)
 
 	record := DNSRecord{
 		Hostname: "_acme-challenge.example.com",
@@ -103,7 +59,7 @@ func TestClient_CreateRecord(t *testing.T) {
 		Value:    "txtxtxtxtxtxt",
 	}
 
-	result, err := client.CreateRecord("zoneID", record)
+	result, err := client.CreateRecord(t.Context(), "zoneID", record)
 	require.NoError(t, err)
 
 	expected := &DNSRecord{
@@ -118,28 +74,15 @@ func TestClient_CreateRecord(t *testing.T) {
 }
 
 func TestClient_RemoveRecord(t *testing.T) {
-	mux := http.NewServeMux()
-	server := httptest.NewServer(mux)
-	t.Cleanup(server.Close)
+	client := servermock.NewBuilder[*Client](setupClient("tokenC"),
+		servermock.CheckHeader().WithJSONHeaders().
+			WithAuthorization("Bearer tokenC"),
+	).
+		Route("DELETE /dns_zones/zoneID/dns_records/recordID",
+			servermock.Noop().
+				WithStatusCode(http.StatusNoContent)).
+		Build(t)
 
-	mux.HandleFunc("/dns_zones/zoneID/dns_records/recordID", func(rw http.ResponseWriter, req *http.Request) {
-		if req.Method != http.MethodDelete {
-			http.Error(rw, "unsupported method", http.StatusMethodNotAllowed)
-			return
-		}
-
-		auth := req.Header.Get("Authorization")
-		if auth != "Bearer tokenC" {
-			http.Error(rw, fmt.Sprintf("invali token: %s", auth), http.StatusUnauthorized)
-			return
-		}
-
-		rw.WriteHeader(http.StatusNoContent)
-	})
-
-	client := NewClient("tokenC")
-	client.BaseURL = server.URL
-
-	err := client.RemoveRecord("zoneID", "recordID")
+	err := client.RemoveRecord(t.Context(), "zoneID", "recordID")
 	require.NoError(t, err)
 }

@@ -1,28 +1,26 @@
 package internal
 
 import (
-	"fmt"
-	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"testing"
 
+	"github.com/go-acme/lego/v4/platform/tester/servermock"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-func handlerMock(method string, jsonData []byte) http.HandlerFunc {
-	return func(rw http.ResponseWriter, req *http.Request) {
-		if req.Method != method {
-			http.Error(rw, "Incorrect method used", http.StatusBadRequest)
-			return
+func setupClient(subAuthID string) func(server *httptest.Server) (*Client, error) {
+	return func(server *httptest.Server) (*Client, error) {
+		client, err := NewClient("myAuthID", subAuthID, "myAuthPassword")
+		if err != nil {
+			return nil, err
 		}
 
-		_, err := rw.Write(jsonData)
-		if err != nil {
-			http.Error(rw, err.Error(), http.StatusInternalServerError)
-			return
-		}
+		client.BaseURL, _ = url.Parse(server.URL)
+		client.HTTPClient = server.Client()
+
+		return client, nil
 	}
 }
 
@@ -81,7 +79,7 @@ func TestClient_GetZone(t *testing.T) {
 		desc        string
 		authFQDN    string
 		apiResponse string
-		expected
+		expected    expected
 	}{
 		{
 			desc:        "zone found",
@@ -109,22 +107,24 @@ func TestClient_GetZone(t *testing.T) {
 			authFQDN:    "_acme-challenge.foo.com.",
 			apiResponse: `[{}]`,
 			expected: expected{
-				errorMsg: "failed to unmarshal zone: json: cannot unmarshal array into Go value of type internal.Zone",
+				errorMsg: "unable to unmarshal response: [status code: 200] body: [{}] error: json: cannot unmarshal array into Go value of type internal.Zone",
 			},
 		},
 	}
 
 	for _, test := range testCases {
 		t.Run(test.desc, func(t *testing.T) {
-			server := httptest.NewServer(handlerMock(http.MethodGet, []byte(test.apiResponse)))
-			t.Cleanup(server.Close)
+			client := servermock.NewBuilder[*Client](setupClient("")).
+				Route("GET /get-zone-info.json",
+					servermock.RawStringResponse(test.apiResponse),
+					servermock.CheckQueryParameter().Strict().
+						With("auth-id", "myAuthID").
+						With("auth-password", "myAuthPassword").
+						With("domain-name", "foo.com"),
+				).
+				Build(t)
 
-			client, err := NewClient("myAuthID", "", "myAuthPassword")
-			require.NoError(t, err)
-
-			client.BaseURL, _ = url.Parse(server.URL)
-
-			zone, err := client.GetZone(test.authFQDN)
+			zone, err := client.GetZone(t.Context(), test.authFQDN)
 
 			if test.expected.errorMsg != "" {
 				require.EqualError(t, err, test.expected.errorMsg)
@@ -147,7 +147,7 @@ func TestClient_FindTxtRecord(t *testing.T) {
 		authFQDN    string
 		zoneName    string
 		apiResponse string
-		expected
+		expected    expected
 	}{
 		{
 			desc:     "record found",
@@ -212,32 +212,36 @@ func TestClient_FindTxtRecord(t *testing.T) {
 		},
 		{
 			desc:        "zero records",
-			authFQDN:    "_acme-challenge.foo.com.",
-			zoneName:    "test-zone",
+			authFQDN:    "_acme-challenge.example.com.",
+			zoneName:    "example.com",
 			apiResponse: `[]`,
 		},
 		{
 			desc:        "invalid json response",
-			authFQDN:    "_acme-challenge.foo.com.",
-			zoneName:    "test-zone",
+			authFQDN:    "_acme-challenge.example.com.",
+			zoneName:    "example.com",
 			apiResponse: `[{}]`,
 			expected: expected{
-				errorMsg: "failed to unmarshall TXT records: json: cannot unmarshal array into Go value of type map[string]internal.TXTRecord: [{}]",
+				errorMsg: "unable to unmarshal response: [status code: 200] body: [{}] error: json: cannot unmarshal array into Go value of type map[string]internal.TXTRecord",
 			},
 		},
 	}
 
 	for _, test := range testCases {
 		t.Run(test.desc, func(t *testing.T) {
-			server := httptest.NewServer(handlerMock(http.MethodGet, []byte(test.apiResponse)))
-			t.Cleanup(server.Close)
+			client := servermock.NewBuilder[*Client](setupClient("")).
+				Route("GET /records.json",
+					servermock.RawStringResponse(test.apiResponse),
+					servermock.CheckQueryParameter().Strict().
+						With("auth-id", "myAuthID").
+						With("auth-password", "myAuthPassword").
+						With("type", "TXT").
+						With("host", "_acme-challenge").
+						With("domain-name", test.zoneName),
+				).
+				Build(t)
 
-			client, err := NewClient("myAuthID", "", "myAuthPassword")
-			require.NoError(t, err)
-
-			client.BaseURL, _ = url.Parse(server.URL)
-
-			txtRecord, err := client.FindTxtRecord(test.zoneName, test.authFQDN)
+			txtRecord, err := client.FindTxtRecord(t.Context(), test.zoneName, test.authFQDN)
 
 			if test.expected.errorMsg != "" {
 				require.EqualError(t, err, test.expected.errorMsg)
@@ -260,7 +264,7 @@ func TestClient_ListTxtRecord(t *testing.T) {
 		authFQDN    string
 		zoneName    string
 		apiResponse string
-		expected
+		expected    expected
 	}{
 		{
 			desc:     "record found",
@@ -327,32 +331,36 @@ func TestClient_ListTxtRecord(t *testing.T) {
 		},
 		{
 			desc:        "zero records",
-			authFQDN:    "_acme-challenge.foo.com.",
-			zoneName:    "test-zone",
+			authFQDN:    "_acme-challenge.example.com.",
+			zoneName:    "example.com",
 			apiResponse: `[]`,
 		},
 		{
 			desc:        "invalid json response",
-			authFQDN:    "_acme-challenge.foo.com.",
-			zoneName:    "test-zone",
+			authFQDN:    "_acme-challenge.example.com.",
+			zoneName:    "example.com",
 			apiResponse: `[{}]`,
 			expected: expected{
-				errorMsg: "failed to unmarshall TXT records: json: cannot unmarshal array into Go value of type map[string]internal.TXTRecord: [{}]",
+				errorMsg: "unable to unmarshal response: [status code: 200] body: [{}] error: json: cannot unmarshal array into Go value of type map[string]internal.TXTRecord",
 			},
 		},
 	}
 
 	for _, test := range testCases {
 		t.Run(test.desc, func(t *testing.T) {
-			server := httptest.NewServer(handlerMock(http.MethodGet, []byte(test.apiResponse)))
-			t.Cleanup(server.Close)
+			client := servermock.NewBuilder[*Client](setupClient("")).
+				Route("GET /records.json",
+					servermock.RawStringResponse(test.apiResponse),
+					servermock.CheckQueryParameter().Strict().
+						With("auth-id", "myAuthID").
+						With("auth-password", "myAuthPassword").
+						With("type", "TXT").
+						With("host", "_acme-challenge").
+						With("domain-name", test.zoneName),
+				).
+				Build(t)
 
-			client, err := NewClient("myAuthID", "", "myAuthPassword")
-			require.NoError(t, err)
-
-			client.BaseURL, _ = url.Parse(server.URL)
-
-			txtRecords, err := client.ListTxtRecords(test.zoneName, test.authFQDN)
+			txtRecords, err := client.ListTxtRecords(t.Context(), test.zoneName, test.authFQDN)
 
 			if test.expected.errorMsg != "" {
 				require.EqualError(t, err, test.expected.errorMsg)
@@ -366,7 +374,7 @@ func TestClient_ListTxtRecord(t *testing.T) {
 
 func TestClient_AddTxtRecord(t *testing.T) {
 	type expected struct {
-		query    string
+		query    url.Values
 		errorMsg string
 	}
 
@@ -379,90 +387,123 @@ func TestClient_AddTxtRecord(t *testing.T) {
 		value       string
 		ttl         int
 		apiResponse string
-		expected
+		expected    expected
 	}{
 		{
 			desc:        "sub-zone",
 			authID:      "myAuthID",
-			zoneName:    "bar.com",
-			authFQDN:    "_acme-challenge.foo.bar.com.",
+			zoneName:    "example.com",
+			authFQDN:    "_acme-challenge.foo.example.com.",
 			value:       "txtTXTtxtTXTtxtTXTtxtTXT",
 			ttl:         60,
 			apiResponse: `{"status":"Success","statusDescription":"The record was added successfully."}`,
 			expected: expected{
-				query: `auth-id=myAuthID&auth-password=myAuthPassword&domain-name=bar.com&host=_acme-challenge.foo&record=txtTXTtxtTXTtxtTXTtxtTXT&record-type=TXT&ttl=60`,
+				query: url.Values{
+					"auth-id":       {"myAuthID"},
+					"auth-password": {"myAuthPassword"},
+					"domain-name":   {"example.com"},
+					"host":          {"_acme-challenge.foo"},
+					"record":        {"txtTXTtxtTXTtxtTXTtxtTXT"},
+					"record-type":   {"TXT"},
+					"ttl":           {"60"},
+				},
 			},
 		},
 		{
 			desc:        "main zone (authID)",
 			authID:      "myAuthID",
-			zoneName:    "bar.com",
-			authFQDN:    "_acme-challenge.bar.com.",
+			zoneName:    "example.com",
+			authFQDN:    "_acme-challenge.example.com.",
 			value:       "TXTtxtTXTtxtTXTtxtTXTtxt",
 			ttl:         60,
 			apiResponse: `{"status":"Success","statusDescription":"The record was added successfully."}`,
 			expected: expected{
-				query: `auth-id=myAuthID&auth-password=myAuthPassword&domain-name=bar.com&host=_acme-challenge&record=TXTtxtTXTtxtTXTtxtTXTtxt&record-type=TXT&ttl=60`,
+				query: url.Values{
+					"auth-id":       {"myAuthID"},
+					"auth-password": {"myAuthPassword"},
+					"domain-name":   {"example.com"},
+					"host":          {"_acme-challenge"},
+					"record":        {"TXTtxtTXTtxtTXTtxtTXTtxt"},
+					"record-type":   {"TXT"},
+					"ttl":           {"60"},
+				},
 			},
 		},
 		{
 			desc:        "main zone (subAuthID)",
 			subAuthID:   "mySubAuthID",
-			zoneName:    "bar.com",
-			authFQDN:    "_acme-challenge.bar.com.",
+			zoneName:    "example.com",
+			authFQDN:    "_acme-challenge.example.com.",
 			value:       "TXTtxtTXTtxtTXTtxtTXTtxt",
 			ttl:         60,
 			apiResponse: `{"status":"Success","statusDescription":"The record was added successfully."}`,
 			expected: expected{
-				query: `auth-password=myAuthPassword&domain-name=bar.com&host=_acme-challenge&record=TXTtxtTXTtxtTXTtxtTXTtxt&record-type=TXT&sub-auth-id=mySubAuthID&ttl=60`,
+				query: url.Values{
+					"auth-password": {"myAuthPassword"},
+					"domain-name":   {"example.com"},
+					"host":          {"_acme-challenge"},
+					"record":        {"TXTtxtTXTtxtTXTtxtTXTtxt"},
+					"record-type":   {"TXT"},
+					"sub-auth-id":   {"mySubAuthID"},
+					"ttl":           {"60"},
+				},
 			},
 		},
 		{
 			desc:        "invalid status",
 			authID:      "myAuthID",
-			zoneName:    "bar.com",
-			authFQDN:    "_acme-challenge.bar.com.",
+			zoneName:    "example.com",
+			authFQDN:    "_acme-challenge.example.com.",
 			value:       "TXTtxtTXTtxtTXTtxtTXTtxt",
 			ttl:         120,
 			apiResponse: `{"status":"Failed","statusDescription":"Invalid TTL. Choose from the list of the values we support."}`,
 			expected: expected{
-				query:    `auth-id=myAuthID&auth-password=myAuthPassword&domain-name=bar.com&host=_acme-challenge&record=TXTtxtTXTtxtTXTtxtTXTtxt&record-type=TXT&ttl=300`,
+				query: url.Values{
+					"auth-id":       {"myAuthID"},
+					"auth-password": {"myAuthPassword"},
+					"domain-name":   {"example.com"},
+					"host":          {"_acme-challenge"},
+					"record":        {"TXTtxtTXTtxtTXTtxtTXTtxt"},
+					"record-type":   {"TXT"},
+					"ttl":           {"300"},
+				},
 				errorMsg: "failed to add TXT record: Failed Invalid TTL. Choose from the list of the values we support.",
 			},
 		},
 		{
 			desc:        "invalid json response",
 			authID:      "myAuthID",
-			zoneName:    "bar.com",
-			authFQDN:    "_acme-challenge.bar.com.",
+			zoneName:    "example.com",
+			authFQDN:    "_acme-challenge.example.com.",
 			value:       "TXTtxtTXTtxtTXTtxtTXTtxt",
 			ttl:         120,
 			apiResponse: `[{}]`,
 			expected: expected{
-				query:    `auth-id=myAuthID&auth-password=myAuthPassword&domain-name=bar.com&host=_acme-challenge&record=TXTtxtTXTtxtTXTtxtTXTtxt&record-type=TXT&ttl=300`,
-				errorMsg: "failed to unmarshal API response: json: cannot unmarshal array into Go value of type internal.apiResponse: [{}]",
+				query: url.Values{
+					"auth-id":       {"myAuthID"},
+					"auth-password": {"myAuthPassword"},
+					"domain-name":   {"example.com"},
+					"host":          {"_acme-challenge"},
+					"record":        {"TXTtxtTXTtxtTXTtxtTXTtxt"},
+					"record-type":   {"TXT"},
+					"ttl":           {"300"},
+				},
+				errorMsg: "unable to unmarshal response: [status code: 200] body: [{}] error: json: cannot unmarshal array into Go value of type internal.apiResponse",
 			},
 		},
 	}
 
 	for _, test := range testCases {
 		t.Run(test.desc, func(t *testing.T) {
-			server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
-				if test.expected.query != req.URL.RawQuery {
-					msg := fmt.Sprintf("got: %s, want: %s", test.expected.query, req.URL.RawQuery)
-					http.Error(rw, msg, http.StatusBadRequest)
-					return
-				}
+			client := servermock.NewBuilder[*Client](setupClient(test.subAuthID)).
+				Route("POST /add-record.json",
+					servermock.RawStringResponse(test.apiResponse),
+					servermock.CheckQueryParameter().Strict().
+						WithValues(test.expected.query),
+				).
+				Build(t)
 
-				handlerMock(http.MethodPost, []byte(test.apiResponse))(rw, req)
-			}))
-
-			client, err := NewClient(test.authID, test.subAuthID, "myAuthPassword")
-			require.NoError(t, err)
-
-			client.BaseURL, _ = url.Parse(server.URL)
-
-			err = client.AddTxtRecord(test.zoneName, test.authFQDN, test.value, test.ttl)
+			err := client.AddTxtRecord(t.Context(), test.zoneName, test.authFQDN, test.value, test.ttl)
 
 			if test.expected.errorMsg != "" {
 				require.EqualError(t, err, test.expected.errorMsg)
@@ -475,7 +516,7 @@ func TestClient_AddTxtRecord(t *testing.T) {
 
 func TestClient_RemoveTxtRecord(t *testing.T) {
 	type expected struct {
-		query    string
+		query    url.Values
 		errorMsg string
 	}
 
@@ -484,7 +525,7 @@ func TestClient_RemoveTxtRecord(t *testing.T) {
 		id          int
 		zoneName    string
 		apiResponse string
-		expected
+		expected    expected
 	}{
 		{
 			desc:        "record found",
@@ -492,7 +533,12 @@ func TestClient_RemoveTxtRecord(t *testing.T) {
 			zoneName:    "foo.com",
 			apiResponse: `{ "status": "Success", "statusDescription": "The record was deleted successfully." }`,
 			expected: expected{
-				query: `auth-id=myAuthID&auth-password=myAuthPassword&domain-name=foo.com&record-id=5769228`,
+				query: url.Values{
+					"auth-id":       {"myAuthID"},
+					"auth-password": {"myAuthPassword"},
+					"domain-name":   {"foo.com"},
+					"record-id":     {"5769228"},
+				},
 			},
 		},
 		{
@@ -501,7 +547,12 @@ func TestClient_RemoveTxtRecord(t *testing.T) {
 			zoneName:    "foo.com",
 			apiResponse: `{ "status": "Failed", "statusDescription": "Invalid record-id param." }`,
 			expected: expected{
-				query:    `auth-id=myAuthID&auth-password=myAuthPassword&domain-name=foo.com&record-id=5769000`,
+				query: url.Values{
+					"auth-id":       {"myAuthID"},
+					"auth-password": {"myAuthPassword"},
+					"domain-name":   {"foo.com"},
+					"record-id":     {"5769000"},
+				},
 				errorMsg: "failed to remove TXT record: Failed Invalid record-id param.",
 			},
 		},
@@ -511,31 +562,28 @@ func TestClient_RemoveTxtRecord(t *testing.T) {
 			zoneName:    "foo-plus.com",
 			apiResponse: `[{}]`,
 			expected: expected{
-				query:    `auth-id=myAuthID&auth-password=myAuthPassword&domain-name=foo-plus.com&record-id=44`,
-				errorMsg: "failed to unmarshal API response: json: cannot unmarshal array into Go value of type internal.apiResponse: [{}]",
+				query: url.Values{
+					"auth-id":       {"myAuthID"},
+					"auth-password": {"myAuthPassword"},
+					"domain-name":   {"foo-plus.com"},
+					"record-id":     {"44"},
+				},
+				errorMsg: "unable to unmarshal response: [status code: 200] body: [{}] error: json: cannot unmarshal array into Go value of type internal.apiResponse",
 			},
 		},
 	}
 
 	for _, test := range testCases {
 		t.Run(test.desc, func(t *testing.T) {
-			server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
-				if test.expected.query != req.URL.RawQuery {
-					msg := fmt.Sprintf("got: %s, want: %s", test.expected.query, req.URL.RawQuery)
-					http.Error(rw, msg, http.StatusBadRequest)
-					return
-				}
+			client := servermock.NewBuilder[*Client](setupClient("")).
+				Route("POST /delete-record.json",
+					servermock.RawStringResponse(test.apiResponse),
+					servermock.CheckQueryParameter().Strict().
+						WithValues(test.expected.query),
+				).
+				Build(t)
 
-				handlerMock(http.MethodPost, []byte(test.apiResponse))(rw, req)
-			}))
-			t.Cleanup(server.Close)
-
-			client, err := NewClient("myAuthID", "", "myAuthPassword")
-			require.NoError(t, err)
-
-			client.BaseURL, _ = url.Parse(server.URL)
-
-			err = client.RemoveTxtRecord(test.id, test.zoneName)
+			err := client.RemoveTxtRecord(t.Context(), test.id, test.zoneName)
 
 			if test.expected.errorMsg != "" {
 				require.EqualError(t, err, test.expected.errorMsg)
@@ -557,7 +605,7 @@ func TestClient_GetUpdateStatus(t *testing.T) {
 		authFQDN    string
 		zoneName    string
 		apiResponse string
-		expected
+		expected    expected
 	}{
 		{
 			desc:     "50% sync",
@@ -591,21 +639,23 @@ func TestClient_GetUpdateStatus(t *testing.T) {
 			authFQDN:    "_acme-challenge.foo.com.",
 			zoneName:    "test-zone",
 			apiResponse: `[x]`,
-			expected:    expected{errorMsg: "failed to unmarshal UpdateRecord: invalid character 'x' looking for beginning of value: [x]"},
+			expected:    expected{errorMsg: "unable to unmarshal response: [status code: 200] body: [x] error: invalid character 'x' looking for beginning of value"},
 		},
 	}
 
 	for _, test := range testCases {
 		t.Run(test.desc, func(t *testing.T) {
-			server := httptest.NewServer(handlerMock(http.MethodGet, []byte(test.apiResponse)))
-			t.Cleanup(server.Close)
+			client := servermock.NewBuilder[*Client](setupClient("")).
+				Route("GET /update-status.json",
+					servermock.RawStringResponse(test.apiResponse),
+					servermock.CheckQueryParameter().Strict().
+						With("auth-id", "myAuthID").
+						With("auth-password", "myAuthPassword").
+						With("domain-name", test.zoneName),
+				).
+				Build(t)
 
-			client, err := NewClient("myAuthID", "", "myAuthPassword")
-			require.NoError(t, err)
-
-			client.BaseURL, _ = url.Parse(server.URL)
-
-			syncProgress, err := client.GetUpdateStatus(test.zoneName)
+			syncProgress, err := client.GetUpdateStatus(t.Context(), test.zoneName)
 
 			if test.expected.errorMsg != "" {
 				require.EqualError(t, err, test.expected.errorMsg)

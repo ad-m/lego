@@ -1,14 +1,19 @@
 package joker
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"time"
 
+	"github.com/go-acme/lego/v4/challenge"
 	"github.com/go-acme/lego/v4/challenge/dns01"
 	"github.com/go-acme/lego/v4/platform/config/env"
+	"github.com/go-acme/lego/v4/providers/dns/internal/clientdebug"
 	"github.com/go-acme/lego/v4/providers/dns/joker/internal/svc"
 )
+
+var _ challenge.ProviderTimeout = (*svcProvider)(nil)
 
 // svcProvider implements the challenge.Provider interface.
 type svcProvider struct {
@@ -43,6 +48,8 @@ func newSvcProviderConfig(config *Config) (*svcProvider, error) {
 
 	client := svc.NewClient(config.Username, config.Password)
 
+	client.HTTPClient = clientdebug.Wrap(client.HTTPClient)
+
 	return &svcProvider{config: config, client: client}, nil
 }
 
@@ -54,30 +61,36 @@ func (d *svcProvider) Timeout() (timeout, interval time.Duration) {
 
 // Present creates a TXT record using the specified parameters.
 func (d *svcProvider) Present(domain, token, keyAuth string) error {
-	fqdn, value := dns01.GetRecord(domain, keyAuth)
+	info := dns01.GetChallengeInfo(domain, keyAuth)
 
-	zone, err := dns01.FindZoneByFqdn(fqdn)
+	zone, err := dns01.FindZoneByFqdn(info.EffectiveFQDN)
+	if err != nil {
+		return fmt.Errorf("joker: could not find zone for domain %q: %w", domain, err)
+	}
+
+	subDomain, err := dns01.ExtractSubDomain(info.EffectiveFQDN, zone)
 	if err != nil {
 		return fmt.Errorf("joker: %w", err)
 	}
 
-	relative := getRelative(fqdn, zone)
-
-	return d.client.Send(dns01.UnFqdn(zone), relative, value)
+	return d.client.SendRequest(context.Background(), dns01.UnFqdn(zone), subDomain, info.Value)
 }
 
 // CleanUp removes the TXT record matching the specified parameters.
 func (d *svcProvider) CleanUp(domain, token, keyAuth string) error {
-	fqdn, _ := dns01.GetRecord(domain, keyAuth)
+	info := dns01.GetChallengeInfo(domain, keyAuth)
 
-	zone, err := dns01.FindZoneByFqdn(fqdn)
+	zone, err := dns01.FindZoneByFqdn(info.EffectiveFQDN)
+	if err != nil {
+		return fmt.Errorf("joker: could not find zone for domain %q: %w", domain, err)
+	}
+
+	subDomain, err := dns01.ExtractSubDomain(info.EffectiveFQDN, zone)
 	if err != nil {
 		return fmt.Errorf("joker: %w", err)
 	}
 
-	relative := getRelative(fqdn, zone)
-
-	return d.client.Send(dns01.UnFqdn(zone), relative, "")
+	return d.client.SendRequest(context.Background(), dns01.UnFqdn(zone), subDomain, "")
 }
 
 // Sequential All DNS challenges for this provider will be resolved sequentially.

@@ -1,14 +1,17 @@
 package lightsail
 
 import (
+	"net/http/httptest"
 	"os"
 	"testing"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/credentials"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/lightsail"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/service/lightsail"
 	"github.com/go-acme/lego/v4/platform/tester"
+	"github.com/go-acme/lego/v4/platform/tester/servermock"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -29,57 +32,50 @@ var envTest = tester.NewEnvTest(
 	WithDomain(EnvDNSZone).
 	WithLiveTestRequirements(envAwsAccessKeyID, envAwsSecretAccessKey, EnvDNSZone)
 
-func makeProvider(serverURL string) (*DNSProvider, error) {
-	config := &aws.Config{
-		Credentials: credentials.NewStaticCredentials("abc", "123", " "),
-		Endpoint:    aws.String(serverURL),
-		Region:      aws.String("mock-region"),
-		MaxRetries:  aws.Int(1),
-	}
-
-	sess, err := session.NewSession(config)
-	if err != nil {
-		return nil, err
-	}
-
-	conf := NewDefaultConfig()
-
-	client := lightsail.New(sess)
-	return &DNSProvider{client: client, config: conf}, nil
-}
-
 func TestCredentialsFromEnv(t *testing.T) {
 	defer envTest.RestoreEnv()
+
 	envTest.ClearEnv()
 
 	_ = os.Setenv(envAwsAccessKeyID, "123")
 	_ = os.Setenv(envAwsSecretAccessKey, "123")
 	_ = os.Setenv(envAwsRegion, "us-east-1")
 
-	config := &aws.Config{
-		CredentialsChainVerboseErrors: aws.Bool(true),
-	}
-
-	sess, err := session.NewSession(config)
+	ctx := t.Context()
+	cfg, err := awsconfig.LoadDefaultConfig(ctx)
 	require.NoError(t, err)
 
-	_, err = sess.Config.Credentials.Get()
+	cs, err := cfg.Credentials.Retrieve(ctx)
 	require.NoError(t, err, "Expected credentials to be set from environment")
+
+	expected := aws.Credentials{
+		AccessKeyID:     "123",
+		SecretAccessKey: "123",
+		Source:          "EnvConfigCredentials",
+	}
+	assert.Equal(t, expected, cs)
 }
 
 func TestDNSProvider_Present(t *testing.T) {
-	mockResponses := map[string]MockResponse{
-		"/": {StatusCode: 200, Body: ""},
-	}
-
-	serverURL := newMockServer(t, mockResponses)
-
-	provider, err := makeProvider(serverURL)
-	require.NoError(t, err)
+	provider := servermock.NewBuilder(
+		func(server *httptest.Server) (*DNSProvider, error) {
+			return &DNSProvider{
+				client: lightsail.NewFromConfig(aws.Config{
+					HTTPClient:       server.Client(),
+					Credentials:      credentials.NewStaticCredentialsProvider("abc", "123", " "),
+					Region:           "mock-region",
+					BaseEndpoint:     aws.String(server.URL),
+					RetryMaxAttempts: 1,
+				}),
+				config: NewDefaultConfig(),
+			}, nil
+		}).
+		Route("POST /", nil).
+		Build(t)
 
 	domain := "example.com"
 	keyAuth := "123456d=="
 
-	err = provider.Present(domain, "", keyAuth)
-	require.NoError(t, err, "Expected Present to return no error")
+	err := provider.Present(domain, "", keyAuth)
+	require.NoError(t, err)
 }

@@ -14,6 +14,8 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"net"
+	"slices"
 	"strings"
 	"time"
 
@@ -25,6 +27,7 @@ const (
 	EC256   = KeyType("P256")
 	EC384   = KeyType("P384")
 	RSA2048 = KeyType("2048")
+	RSA3072 = KeyType("3072")
 	RSA4096 = KeyType("4096")
 	RSA8192 = KeyType("8192")
 )
@@ -54,8 +57,10 @@ type DERCertificateBytes []byte
 // ParsePEMBundle parses a certificate bundle from top to bottom and returns
 // a slice of x509 certificates. This function will error if no certificates are found.
 func ParsePEMBundle(bundle []byte) ([]*x509.Certificate, error) {
-	var certificates []*x509.Certificate
-	var certDERBlock *pem.Block
+	var (
+		certificates []*x509.Certificate
+		certDERBlock *pem.Block
+	)
 
 	for {
 		certDERBlock, bundle = pem.Decode(bundle)
@@ -68,6 +73,7 @@ func ParsePEMBundle(bundle []byte) ([]*x509.Certificate, error) {
 			if err != nil {
 				return nil, err
 			}
+
 			certificates = append(certificates, cert)
 		}
 	}
@@ -82,9 +88,12 @@ func ParsePEMBundle(bundle []byte) ([]*x509.Certificate, error) {
 // ParsePEMPrivateKey parses a private key from key, which is a PEM block.
 // Borrowed from Go standard library, to handle various private key and PEM block types.
 // https://github.com/golang/go/blob/693748e9fa385f1e2c3b91ca9acbb6c0ad2d133d/src/crypto/tls/tls.go#L291-L308
-// https://github.com/golang/go/blob/693748e9fa385f1e2c3b91ca9acbb6c0ad2d133d/src/crypto/tls/tls.go#L238)
+// https://github.com/golang/go/blob/693748e9fa385f1e2c3b91ca9acbb6c0ad2d133d/src/crypto/tls/tls.go#L238
 func ParsePEMPrivateKey(key []byte) (crypto.PrivateKey, error) {
 	keyBlockDER, _ := pem.Decode(key)
+	if keyBlockDER == nil {
+		return nil, errors.New("invalid PEM block")
+	}
 
 	if keyBlockDER.Type != "PRIVATE KEY" && !strings.HasSuffix(keyBlockDER.Type, " PRIVATE KEY") {
 		return nil, fmt.Errorf("unknown PEM header %q", keyBlockDER.Type)
@@ -118,6 +127,8 @@ func GeneratePrivateKey(keyType KeyType) (crypto.PrivateKey, error) {
 		return ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
 	case RSA2048:
 		return rsa.GenerateKey(rand.Reader, 2048)
+	case RSA3072:
+		return rsa.GenerateKey(rand.Reader, 3072)
 	case RSA4096:
 		return rsa.GenerateKey(rand.Reader, 4096)
 	case RSA8192:
@@ -127,13 +138,44 @@ func GeneratePrivateKey(keyType KeyType) (crypto.PrivateKey, error) {
 	return nil, fmt.Errorf("invalid KeyType: %s", keyType)
 }
 
+// Deprecated: uses [CreateCSR] instead.
 func GenerateCSR(privateKey crypto.PrivateKey, domain string, san []string, mustStaple bool) ([]byte, error) {
-	template := x509.CertificateRequest{
-		Subject:  pkix.Name{CommonName: domain},
-		DNSNames: san,
+	return CreateCSR(privateKey, CSROptions{
+		Domain:     domain,
+		SAN:        san,
+		MustStaple: mustStaple,
+	})
+}
+
+type CSROptions struct {
+	Domain         string
+	SAN            []string
+	MustStaple     bool
+	EmailAddresses []string
+}
+
+func CreateCSR(privateKey crypto.PrivateKey, opts CSROptions) ([]byte, error) {
+	var (
+		dnsNames    []string
+		ipAddresses []net.IP
+	)
+
+	for _, altname := range opts.SAN {
+		if ip := net.ParseIP(altname); ip != nil {
+			ipAddresses = append(ipAddresses, ip)
+		} else {
+			dnsNames = append(dnsNames, altname)
+		}
 	}
 
-	if mustStaple {
+	template := x509.CertificateRequest{
+		Subject:        pkix.Name{CommonName: opts.Domain},
+		DNSNames:       dnsNames,
+		EmailAddresses: opts.EmailAddresses,
+		IPAddresses:    ipAddresses,
+	}
+
+	if opts.MustStaple {
 		template.ExtraExtensions = append(template.ExtraExtensions, pkix.Extension{
 			Id:    tlsFeatureExtensionOID,
 			Value: ocspMustStapleFeature,
@@ -143,12 +185,13 @@ func GenerateCSR(privateKey crypto.PrivateKey, domain string, san []string, must
 	return x509.CreateCertificateRequest(rand.Reader, &template, privateKey)
 }
 
-func PEMEncode(data interface{}) []byte {
+func PEMEncode(data any) []byte {
 	return pem.EncodeToMemory(PEMBlock(data))
 }
 
-func PEMBlock(data interface{}) *pem.Block {
+func PEMBlock(data any) *pem.Block {
 	var pemBlock *pem.Block
+
 	switch key := data.(type) {
 	case *ecdsa.PrivateKey:
 		keyBytes, _ := x509.MarshalECPrivateKey(key)
@@ -179,7 +222,7 @@ func PemDecodeTox509CSR(data []byte) (*x509.CertificateRequest, error) {
 		return nil, err
 	}
 
-	if pemBlock.Type != "CERTIFICATE REQUEST" {
+	if pemBlock.Type != "CERTIFICATE REQUEST" && pemBlock.Type != "NEW CERTIFICATE REQUEST" {
 		return nil, errors.New("PEM block is not a certificate request")
 	}
 
@@ -198,6 +241,30 @@ func ParsePEMCertificate(cert []byte) (*x509.Certificate, error) {
 	return x509.ParseCertificate(pemBlock.Bytes)
 }
 
+func GetCertificateMainDomain(cert *x509.Certificate) (string, error) {
+	return getMainDomain(cert.Subject, cert.DNSNames, cert.IPAddresses)
+}
+
+func GetCSRMainDomain(cert *x509.CertificateRequest) (string, error) {
+	return getMainDomain(cert.Subject, cert.DNSNames, cert.IPAddresses)
+}
+
+func getMainDomain(subject pkix.Name, dnsNames []string, ips []net.IP) (string, error) {
+	if subject.CommonName == "" && len(dnsNames) == 0 && len(ips) == 0 {
+		return "", errors.New("missing domain")
+	}
+
+	if subject.CommonName != "" {
+		return subject.CommonName, nil
+	}
+
+	if len(dnsNames) > 0 {
+		return dnsNames[0], nil
+	}
+
+	return ips[0].String(), nil
+}
+
 func ExtractDomains(cert *x509.Certificate) []string {
 	var domains []string
 	if cert.Subject.CommonName != "" {
@@ -209,7 +276,15 @@ func ExtractDomains(cert *x509.Certificate) []string {
 		if sanDomain == cert.Subject.CommonName {
 			continue
 		}
+
 		domains = append(domains, sanDomain)
+	}
+
+	commonNameIP := net.ParseIP(cert.Subject.CommonName)
+	for _, sanIP := range cert.IPAddresses {
+		if !commonNameIP.Equal(sanIP) {
+			domains = append(domains, sanIP.String())
+		}
 	}
 
 	return domains
@@ -223,7 +298,7 @@ func ExtractDomainsCSR(csr *x509.CertificateRequest) []string {
 
 	// loop over the SubjectAltName DNS names
 	for _, sanName := range csr.DNSNames {
-		if containsSAN(domains, sanName) {
+		if slices.Contains(domains, sanName) {
 			// Duplicate; skip this name
 			continue
 		}
@@ -232,16 +307,14 @@ func ExtractDomainsCSR(csr *x509.CertificateRequest) []string {
 		domains = append(domains, sanName)
 	}
 
-	return domains
-}
-
-func containsSAN(domains []string, sanName string) bool {
-	for _, existingName := range domains {
-		if existingName == sanName {
-			return true
+	cnip := net.ParseIP(csr.Subject.CommonName)
+	for _, sanIP := range csr.IPAddresses {
+		if !cnip.Equal(sanIP) {
+			domains = append(domains, sanIP.String())
 		}
 	}
-	return false
+
+	return domains
 }
 
 func GeneratePemCert(privateKey *rsa.PrivateKey, domain string, extensions []pkix.Extension) ([]byte, error) {
@@ -255,13 +328,14 @@ func GeneratePemCert(privateKey *rsa.PrivateKey, domain string, extensions []pki
 
 func generateDerCert(privateKey *rsa.PrivateKey, expiration time.Time, domain string, extensions []pkix.Extension) ([]byte, error) {
 	serialNumberLimit := new(big.Int).Lsh(big.NewInt(1), 128)
+
 	serialNumber, err := rand.Int(rand.Reader, serialNumberLimit)
 	if err != nil {
 		return nil, err
 	}
 
 	if expiration.IsZero() {
-		expiration = time.Now().Add(365)
+		expiration = time.Now().AddDate(1, 0, 0)
 	}
 
 	template := x509.Certificate{
@@ -274,8 +348,14 @@ func generateDerCert(privateKey *rsa.PrivateKey, expiration time.Time, domain st
 
 		KeyUsage:              x509.KeyUsageKeyEncipherment,
 		BasicConstraintsValid: true,
-		DNSNames:              []string{domain},
 		ExtraExtensions:       extensions,
+	}
+
+	// handling SAN filling as type suspected
+	if ip := net.ParseIP(domain); ip != nil {
+		template.IPAddresses = []net.IP{ip}
+	} else {
+		template.DNSNames = []string{domain}
 	}
 
 	return x509.CreateCertificate(rand.Reader, &template, &template, &privateKey.PublicKey, privateKey)

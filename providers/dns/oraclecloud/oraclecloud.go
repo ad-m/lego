@@ -8,24 +8,38 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/go-acme/lego/v4/challenge"
 	"github.com/go-acme/lego/v4/challenge/dns01"
 	"github.com/go-acme/lego/v4/platform/config/env"
-	"github.com/oracle/oci-go-sdk/common"
-	"github.com/oracle/oci-go-sdk/dns"
+	"github.com/go-acme/lego/v4/providers/dns/internal/clientdebug"
+	"github.com/nrdcg/oci-go-sdk/common/v1065"
+	"github.com/nrdcg/oci-go-sdk/common/v1065/auth"
+	"github.com/nrdcg/oci-go-sdk/dns/v1065"
 )
 
 // Environment variables names.
 const (
 	envNamespace = "OCI_"
 
-	EnvCompartmentOCID   = envNamespace + "COMPARTMENT_OCID"
+	EnvAuthType = envNamespace + "AUTH_TYPE"
+
+	EnvCompartmentOCID = envNamespace + "COMPARTMENT_OCID"
+	EnvRegion          = envNamespace + "REGION"
+
+	EnvProfile    = envNamespace + "PROFILE"
+	EnvConfigFile = envNamespace + "CONFIG_FILE"
+
 	envPrivKey           = envNamespace + "PRIVKEY"
 	EnvPrivKeyFile       = envPrivKey + "_FILE"
 	EnvPrivKeyPass       = envPrivKey + "_PASS"
 	EnvTenancyOCID       = envNamespace + "TENANCY_OCID"
 	EnvUserOCID          = envNamespace + "USER_OCID"
 	EnvPubKeyFingerprint = envNamespace + "PUBKEY_FINGERPRINT"
-	EnvRegion            = envNamespace + "REGION"
+
+	altEnvPrivateKey         = envNamespace + "PRIVATE_KEY"   // alias on OCI_PRIVKEY
+	altEnvPrivateKeyPath     = altEnvPrivateKey + "_PATH"     // alias on OCI_PRIVKEY_FILE
+	altEnvPrivateKeyPassword = altEnvPrivateKey + "_PASSWORD" // alias on OCI_PRIVKEY_PASS
+	altEnvFingerprint        = envNamespace + "FINGERPRINT"   // alias on OCI_PUBKEY_FINGERPRINT
 
 	EnvTTL                = envNamespace + "TTL"
 	EnvPropagationTimeout = envNamespace + "PROPAGATION_TIMEOUT"
@@ -33,10 +47,25 @@ const (
 	EnvHTTPTimeout        = envNamespace + "HTTP_TIMEOUT"
 )
 
+// https://github.com/oracle/oci-go-sdk/blob/7f425f74c74fd0c6a5acb74466c85eb5346e0092/common/client.go#L350
+// https://github.com/oracle/oci-go-sdk/blob/7f425f74c74fd0c6a5acb74466c85eb5346e0092/common/configuration.go#L174-L175
+const (
+	altEnvTFVarNamespace          = "TF_VAR_"
+	altEnvTFVarRegion             = altEnvTFVarNamespace + "region"               // alias on OCI_REGION
+	altEnvTFVarFingerprint        = altEnvTFVarNamespace + "fingerprint"          // alias on OCI_PUBKEY_FINGERPRINT
+	altEnvTFVarUserOCID           = altEnvTFVarNamespace + "user_ocid"            // alias on OCI_USER_OCID
+	altEnvTFVarTenancyOCID        = altEnvTFVarNamespace + "tenancy_ocid"         // alias on OCI_TENANCY_OCID
+	altEnvTFVarPrivateKeyPath     = altEnvTFVarNamespace + "private_key_path"     // alias on OCI_PRIVKEY_FILE
+	altEnvTFVarPrivateKeyPassword = altEnvTFVarNamespace + "private_key_password" // alias on OCI_PRIVKEY_PASS
+)
+
+var _ challenge.ProviderTimeout = (*DNSProvider)(nil)
+
 // Config is used to configure the creation of the DNSProvider.
 type Config struct {
-	CompartmentID      string
-	OCIConfigProvider  common.ConfigurationProvider
+	CompartmentID     string
+	OCIConfigProvider common.ConfigurationProvider
+
 	PropagationTimeout time.Duration
 	PollingInterval    time.Duration
 	TTL                int
@@ -50,7 +79,7 @@ func NewDefaultConfig() *Config {
 		PropagationTimeout: env.GetOrDefaultSecond(EnvPropagationTimeout, dns01.DefaultPropagationTimeout),
 		PollingInterval:    env.GetOrDefaultSecond(EnvPollingInterval, dns01.DefaultPollingInterval),
 		HTTPClient: &http.Client{
-			Timeout: env.GetOrDefaultSecond(EnvHTTPTimeout, 60*time.Second),
+			Timeout: env.GetOrDefaultSecond(EnvHTTPTimeout, time.Minute),
 		},
 	}
 }
@@ -63,14 +92,53 @@ type DNSProvider struct {
 
 // NewDNSProvider returns a DNSProvider instance configured for OracleCloud.
 func NewDNSProvider() (*DNSProvider, error) {
-	values, err := env.Get(envPrivKey, EnvTenancyOCID, EnvUserOCID, EnvPubKeyFingerprint, EnvRegion, EnvCompartmentOCID)
-	if err != nil {
-		return nil, fmt.Errorf("oraclecloud: %w", err)
-	}
-
 	config := NewDefaultConfig()
-	config.CompartmentID = values[EnvCompartmentOCID]
-	config.OCIConfigProvider = newConfigProvider(values)
+
+	switch env.GetOrFile(EnvAuthType) {
+	case string(common.InstancePrincipal):
+		values, err := env.Get(EnvCompartmentOCID)
+		if err != nil {
+			return nil, fmt.Errorf("oraclecloud: %w", err)
+		}
+
+		config.CompartmentID = values[EnvCompartmentOCID]
+
+		region := env.GetOneWithFallback(EnvRegion, "", env.ParseString, altEnvTFVarRegion)
+
+		configurationProvider, err := auth.InstancePrincipalConfigurationProviderForRegion(common.Region(region))
+		if err != nil {
+			return nil, fmt.Errorf("oraclecloud: %w", err)
+		}
+
+		config.OCIConfigProvider = configurationProvider
+
+	case string(common.UserPrincipal):
+		values, err := env.Get(EnvCompartmentOCID, EnvProfile)
+		if err != nil {
+			return nil, fmt.Errorf("oraclecloud: %w", err)
+		}
+
+		config.CompartmentID = values[EnvCompartmentOCID]
+
+		configFile := env.GetOrDefaultString(EnvConfigFile, "")
+
+		config.OCIConfigProvider = common.CustomProfileSessionTokenConfigProvider(configFile, values[EnvProfile])
+
+	default:
+		values, err := env.Get(EnvCompartmentOCID)
+		if err != nil {
+			return nil, fmt.Errorf("oraclecloud: %w", err)
+		}
+
+		config.CompartmentID = values[EnvCompartmentOCID]
+
+		ecp, err := newEnvironmentConfigurationProvider()
+		if err != nil {
+			return nil, fmt.Errorf("oraclecloud: %w", err)
+		}
+
+		config.OCIConfigProvider = ecp
+	}
 
 	return NewDNSProviderConfig(config)
 }
@@ -95,7 +163,7 @@ func NewDNSProviderConfig(config *Config) (*DNSProvider, error) {
 	}
 
 	if config.HTTPClient != nil {
-		client.HTTPClient = config.HTTPClient
+		client.HTTPClient = clientdebug.Wrap(config.HTTPClient)
 	}
 
 	return &DNSProvider{client: &client, config: config}, nil
@@ -103,17 +171,17 @@ func NewDNSProviderConfig(config *Config) (*DNSProvider, error) {
 
 // Present creates a TXT record to fulfill the dns-01 challenge.
 func (d *DNSProvider) Present(domain, token, keyAuth string) error {
-	fqdn, value := dns01.GetRecord(domain, keyAuth)
+	info := dns01.GetChallengeInfo(domain, keyAuth)
 
-	zoneNameOrID, err1 := dns01.FindZoneByFqdn(dns01.ToFqdn(domain))
-	if err1 != nil {
-		return fmt.Errorf("oraclecloud: could not find zone for domain %q and fqdn %q : %w", domain, fqdn, err1)
+	zoneNameOrID, err := dns01.FindZoneByFqdn(info.EffectiveFQDN)
+	if err != nil {
+		return fmt.Errorf("oraclecloud: could not find zone for domain %q: %w", domain, err)
 	}
 
 	// generate request to dns.PatchDomainRecordsRequest
 	recordOperation := dns.RecordOperation{
-		Domain:      common.String(dns01.UnFqdn(fqdn)),
-		Rdata:       common.String(value),
+		Domain:      common.String(dns01.UnFqdn(info.EffectiveFQDN)),
+		Rdata:       common.String(info.Value),
 		Rtype:       common.String("TXT"),
 		Ttl:         common.Int(d.config.TTL),
 		IsProtected: common.Bool(false),
@@ -122,13 +190,13 @@ func (d *DNSProvider) Present(domain, token, keyAuth string) error {
 	request := dns.PatchDomainRecordsRequest{
 		CompartmentId: common.String(d.config.CompartmentID),
 		ZoneNameOrId:  common.String(zoneNameOrID),
-		Domain:        common.String(dns01.UnFqdn(fqdn)),
+		Domain:        common.String(dns01.UnFqdn(info.EffectiveFQDN)),
 		PatchDomainRecordsDetails: dns.PatchDomainRecordsDetails{
 			Items: []dns.RecordOperation{recordOperation},
 		},
 	}
 
-	_, err := d.client.PatchDomainRecords(context.Background(), request)
+	_, err = d.client.PatchDomainRecords(context.Background(), request)
 	if err != nil {
 		return fmt.Errorf("oraclecloud: %w", err)
 	}
@@ -138,17 +206,17 @@ func (d *DNSProvider) Present(domain, token, keyAuth string) error {
 
 // CleanUp removes the TXT record matching the specified parameters.
 func (d *DNSProvider) CleanUp(domain, token, keyAuth string) error {
-	fqdn, value := dns01.GetRecord(domain, keyAuth)
+	info := dns01.GetChallengeInfo(domain, keyAuth)
 
-	zoneNameOrID, err1 := dns01.FindZoneByFqdn(dns01.ToFqdn(domain))
-	if err1 != nil {
-		return fmt.Errorf("oraclecloud: could not find zone for domain %q and fqdn %q : %w", domain, fqdn, err1)
+	zoneNameOrID, err := dns01.FindZoneByFqdn(info.EffectiveFQDN)
+	if err != nil {
+		return fmt.Errorf("oraclecloud: could not find zone for domain %q: %w", domain, err)
 	}
 
 	// search to TXT record's hash to delete
 	getRequest := dns.GetDomainRecordsRequest{
 		ZoneNameOrId:  common.String(zoneNameOrID),
-		Domain:        common.String(dns01.UnFqdn(fqdn)),
+		Domain:        common.String(dns01.UnFqdn(info.EffectiveFQDN)),
 		CompartmentId: common.String(d.config.CompartmentID),
 		Rtype:         common.String("TXT"),
 	}
@@ -161,19 +229,20 @@ func (d *DNSProvider) CleanUp(domain, token, keyAuth string) error {
 	}
 
 	if *domainRecords.OpcTotalItems == 0 {
-		return errors.New("oraclecloud: no record to CleanUp")
+		return errors.New("oraclecloud: no record to clean up")
 	}
 
 	var deleteHash *string
-	for _, record := range domainRecords.RecordCollection.Items {
-		if record.Rdata != nil && *record.Rdata == `"`+value+`"` {
+
+	for _, record := range domainRecords.Items {
+		if record.Rdata != nil && *record.Rdata == `"`+info.Value+`"` {
 			deleteHash = record.RecordHash
 			break
 		}
 	}
 
 	if deleteHash == nil {
-		return errors.New("oraclecloud: no record to CleanUp")
+		return errors.New("oraclecloud: no record to clean up")
 	}
 
 	recordOperation := dns.RecordOperation{
@@ -183,7 +252,7 @@ func (d *DNSProvider) CleanUp(domain, token, keyAuth string) error {
 
 	patchRequest := dns.PatchDomainRecordsRequest{
 		ZoneNameOrId: common.String(zoneNameOrID),
-		Domain:       common.String(dns01.UnFqdn(fqdn)),
+		Domain:       common.String(dns01.UnFqdn(info.EffectiveFQDN)),
 		PatchDomainRecordsDetails: dns.PatchDomainRecordsDetails{
 			Items: []dns.RecordOperation{recordOperation},
 		},

@@ -1,8 +1,8 @@
 package loopia
 
 import (
+	"context"
 	"errors"
-	"fmt"
 	"testing"
 
 	"github.com/go-acme/lego/v4/providers/dns/loopia/internal"
@@ -46,7 +46,7 @@ func TestDNSProvider_Present(t *testing.T) {
 		{
 			desc: "AddTXTRecord fails",
 
-			addTXTRecordError: fmt.Errorf("unknown error: 'ADDTXT'"),
+			addTXTRecordError: errors.New("unknown error: 'ADDTXT'"),
 			callAddTXTRecord:  true,
 
 			expectedError: "loopia: failed to add TXT record: unknown error: 'ADDTXT'",
@@ -54,7 +54,7 @@ func TestDNSProvider_Present(t *testing.T) {
 		{
 			desc: "GetTXTRecords fails",
 
-			getTXTRecordsError: fmt.Errorf("unknown error: 'GETTXT'"),
+			getTXTRecordsError: errors.New("unknown error: 'GETTXT'"),
 			callAddTXTRecord:   true,
 			callGetTXTRecords:  true,
 
@@ -148,10 +148,10 @@ func TestDNSProvider_Cleanup(t *testing.T) {
 			callGetTXTRecords:    true,
 			callRemoveSubdomain:  true,
 
-			expectedError: `loopia: failed to remove sub-domain: unknown error: "UNKNOWN_ERROR"`,
+			expectedError: `loopia: failed to remove subdomain: unknown error: "UNKNOWN_ERROR"`,
 		},
 		{
-			desc: "Dont call removeSubdomain when records",
+			desc: "Don't call removeSubdomain when records",
 
 			getTXTRecordsReturn: []internal.RecordObj{{Type: "TXT", Rdata: "LEFTOVER"}},
 			callAddTXTRecord:    true,
@@ -215,22 +215,22 @@ type mockedClient struct {
 	mock.Mock
 }
 
-func (c *mockedClient) RemoveTXTRecord(domain string, subdomain string, recordID int) error {
+func (c *mockedClient) RemoveTXTRecord(ctx context.Context, domain, subdomain string, recordID int) error {
 	args := c.Called(domain, subdomain, recordID)
 	return args.Error(0)
 }
 
-func (c *mockedClient) AddTXTRecord(domain string, subdomain string, ttl int, value string) error {
+func (c *mockedClient) AddTXTRecord(ctx context.Context, domain, subdomain string, ttl int, value string) error {
 	args := c.Called(domain, subdomain, ttl, value)
 	return args.Error(0)
 }
 
-func (c *mockedClient) GetTXTRecords(domain string, subdomain string) ([]internal.RecordObj, error) {
+func (c *mockedClient) GetTXTRecords(ctx context.Context, domain, subdomain string) ([]internal.RecordObj, error) {
 	args := c.Called(domain, subdomain)
 	return args.Get(0).([]internal.RecordObj), args.Error(1)
 }
 
-func (c *mockedClient) RemoveSubdomain(domain, subdomain string) error {
+func (c *mockedClient) RemoveSubdomain(ctx context.Context, domain, subdomain string) error {
 	args := c.Called(domain, subdomain)
 	return args.Error(0)
 }

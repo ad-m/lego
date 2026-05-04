@@ -1,13 +1,15 @@
 package http01
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-func TestParseForwardedHeader(t *testing.T) {
+func Test_parseForwardedHeader(t *testing.T) {
 	testCases := []struct {
 		name  string
 		input string
@@ -69,18 +71,117 @@ func TestParseForwardedHeader(t *testing.T) {
 	}
 
 	for _, test := range testCases {
-		test := test
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 
 			actual, err := parseForwardedHeader(test.input)
 			if test.err == "" {
 				require.NoError(t, err)
-				assert.EqualValues(t, test.want, actual)
+				assert.Equal(t, test.want, actual)
 			} else {
 				require.Error(t, err)
 				assert.Contains(t, err.Error(), test.err)
 			}
+		})
+	}
+}
+
+func Test_hostMatcher_matches(t *testing.T) {
+	hm := &hostMatcher{}
+
+	testCases := []struct {
+		desc     string
+		domain   string
+		req      *http.Request
+		expected assert.BoolAssertionFunc
+	}{
+		{
+			desc:     "exact domain",
+			domain:   "example.com",
+			req:      httptest.NewRequest(http.MethodGet, "http://example.com", nil),
+			expected: assert.True,
+		},
+		{
+			desc:     "case-insensitive",
+			domain:   "Example.com",
+			req:      httptest.NewRequest(http.MethodGet, "http://exAmple.com", nil),
+			expected: assert.True,
+		},
+		{
+			desc:     "subdomain",
+			domain:   "example.com",
+			req:      httptest.NewRequest(http.MethodGet, "http://foo.example.com", nil),
+			expected: assert.False,
+		},
+		{
+			desc:     "fqdn",
+			domain:   "example.com",
+			req:      httptest.NewRequest(http.MethodGet, "http://example.com.", nil),
+			expected: assert.True,
+		},
+		{
+			desc:     "fqdn with a port",
+			domain:   "example.com",
+			req:      httptest.NewRequest(http.MethodGet, "http://example.com.:8080", nil),
+			expected: assert.True,
+		},
+		{
+			desc:     "with a port",
+			domain:   "example.com",
+			req:      httptest.NewRequest(http.MethodGet, "http://example.com:8080", nil),
+			expected: assert.True,
+		},
+		{
+			desc:     "wrong",
+			domain:   "example.com",
+			req:      httptest.NewRequest(http.MethodGet, "http://example.com.foo", nil),
+			expected: assert.False,
+		},
+		{
+			desc:     "request with path",
+			domain:   "example.com",
+			req:      httptest.NewRequest(http.MethodGet, "http://example.com/foo/bar", nil),
+			expected: assert.True,
+		},
+		{
+			desc:     "ipv4",
+			domain:   "127.0.0.1",
+			req:      httptest.NewRequest(http.MethodGet, "http://127.0.0.1", nil),
+			expected: assert.True,
+		},
+		{
+			desc:     "ipv4 with port",
+			domain:   "127.0.0.1",
+			req:      httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8080", nil),
+			expected: assert.True,
+		},
+		{
+			desc:     "ipv6",
+			domain:   "2001:db8::1",
+			req:      httptest.NewRequest(http.MethodGet, "http://[2001:db8::1]", nil),
+			expected: assert.True,
+		},
+		{
+			desc:     "ipv6 with port",
+			domain:   "2001:db8::1",
+			req:      httptest.NewRequest(http.MethodGet, "http://[2001:db8::1]:8080", nil),
+			expected: assert.True,
+		},
+		{
+			desc:     "ipv6 with brackets",
+			domain:   "[2001:db8::1]",
+			req:      httptest.NewRequest(http.MethodGet, "http://[2001:db8::1]", nil),
+			expected: assert.True,
+		},
+	}
+
+	for _, test := range testCases {
+		t.Run(test.desc, func(t *testing.T) {
+			t.Parallel()
+
+			hm.matches(test.req, test.domain)
+
+			test.expected(t, hm.matches(test.req, test.domain))
 		})
 	}
 }

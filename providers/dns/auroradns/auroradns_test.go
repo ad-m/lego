@@ -1,36 +1,32 @@
 package auroradns
 
 import (
-	"fmt"
-	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
 	"github.com/go-acme/lego/v4/platform/tester"
-	"github.com/stretchr/testify/assert"
+	"github.com/go-acme/lego/v4/platform/tester/servermock"
+	"github.com/nrdcg/auroradns"
 	"github.com/stretchr/testify/require"
 )
 
-var envTest = tester.NewEnvTest(
-	EnvUserID,
-	EnvKey)
+var envTest = tester.NewEnvTest(EnvAPIKey, EnvSecret)
 
-func setupTest() (*DNSProvider, *http.ServeMux, func()) {
-	handler := http.NewServeMux()
-	server := httptest.NewServer(handler)
+func mockBuilder() *servermock.Builder[*DNSProvider] {
+	return servermock.NewBuilder(
+		func(server *httptest.Server) (*DNSProvider, error) {
+			config := NewDefaultConfig()
+			config.APIKey = "asdf1234"
+			config.Secret = "key"
+			config.BaseURL = server.URL
 
-	config := NewDefaultConfig()
-	config.UserID = "asdf1234"
-	config.Key = "key"
-	config.BaseURL = server.URL
-
-	provider, err := NewDNSProviderConfig(config)
-	if err != nil {
-		panic(err)
-	}
-
-	return provider, handler, server.Close
+			return NewDNSProviderConfig(config)
+		},
+		servermock.CheckHeader().
+			WithContentType("application/json").
+			WithRegexp("Authorization", `AuroraDNSv1 .+`).
+			WithRegexp("X-Auroradns-Date", `[0-9TZ]+`))
 }
 
 func TestNewDNSProvider(t *testing.T) {
@@ -42,39 +38,40 @@ func TestNewDNSProvider(t *testing.T) {
 		{
 			desc: "success",
 			envVars: map[string]string{
-				EnvUserID: "123",
-				EnvKey:    "456",
+				EnvAPIKey: "123",
+				EnvSecret: "456",
 			},
 		},
 		{
 			desc: "missing credentials",
 			envVars: map[string]string{
-				EnvUserID: "",
-				EnvKey:    "",
+				EnvAPIKey: "",
+				EnvSecret: "",
 			},
-			expected: "aurora: some credentials information are missing: AURORA_USER_ID,AURORA_KEY",
+			expected: "aurora: some credentials information are missing: AURORA_API_KEY,AURORA_SECRET",
 		},
 		{
-			desc: "missing user id",
+			desc: "missing api key",
 			envVars: map[string]string{
-				EnvUserID: "",
-				EnvKey:    "456",
+				EnvAPIKey: "",
+				EnvSecret: "456",
 			},
-			expected: "aurora: some credentials information are missing: AURORA_USER_ID",
+			expected: "aurora: some credentials information are missing: AURORA_API_KEY",
 		},
 		{
-			desc: "missing key",
+			desc: "missing secret key",
 			envVars: map[string]string{
-				EnvUserID: "123",
-				EnvKey:    "",
+				EnvAPIKey: "123",
+				EnvSecret: "",
 			},
-			expected: "aurora: some credentials information are missing: AURORA_KEY",
+			expected: "aurora: some credentials information are missing: AURORA_SECRET",
 		},
 	}
 
 	for _, test := range testCases {
 		t.Run(test.desc, func(t *testing.T) {
 			defer envTest.RestoreEnv()
+
 			envTest.ClearEnv()
 
 			envTest.Apply(test.envVars)
@@ -96,31 +93,31 @@ func TestNewDNSProvider(t *testing.T) {
 func TestNewDNSProviderConfig(t *testing.T) {
 	testCases := []struct {
 		desc     string
-		userID   string
-		key      string
+		apiKey   string
+		secret   string
 		expected string
 	}{
 		{
 			desc:   "success",
-			userID: "123",
-			key:    "456",
+			apiKey: "123",
+			secret: "456",
 		},
 		{
 			desc:     "missing credentials",
-			userID:   "",
-			key:      "",
+			apiKey:   "",
+			secret:   "",
 			expected: "aurora: some credentials information are missing",
 		},
 		{
 			desc:     "missing user id",
-			userID:   "",
-			key:      "456",
+			apiKey:   "",
+			secret:   "456",
 			expected: "aurora: some credentials information are missing",
 		},
 		{
 			desc:     "missing key",
-			userID:   "123",
-			key:      "",
+			apiKey:   "123",
+			secret:   "",
 			expected: "aurora: some credentials information are missing",
 		},
 	}
@@ -128,8 +125,8 @@ func TestNewDNSProviderConfig(t *testing.T) {
 	for _, test := range testCases {
 		t.Run(test.desc, func(t *testing.T) {
 			config := NewDefaultConfig()
-			config.UserID = test.userID
-			config.Key = test.key
+			config.APIKey = test.apiKey
+			config.Secret = test.secret
 
 			p, err := NewDNSProviderConfig(config)
 
@@ -146,78 +143,51 @@ func TestNewDNSProviderConfig(t *testing.T) {
 }
 
 func TestDNSProvider_Present(t *testing.T) {
-	provider, mux, tearDown := setupTest()
-	defer tearDown()
-
-	mux.HandleFunc("/zones", func(w http.ResponseWriter, r *http.Request) {
-		assert.Equal(t, http.MethodGet, r.Method, "method")
-
-		w.WriteHeader(http.StatusCreated)
-		fmt.Fprintf(w, `[{
-			        "id":   "c56a4180-65aa-42ec-a945-5fd21dec0538",
-			        "name": "example.com"
-			      }]`)
-	})
-
-	mux.HandleFunc("/zones/c56a4180-65aa-42ec-a945-5fd21dec0538/records", func(w http.ResponseWriter, r *http.Request) {
-		assert.Equal(t, http.MethodPost, r.Method)
-		assert.Equal(t, "application/json", r.Header.Get("Content-Type"), "Content-Type")
-
-		reqBody, err := ioutil.ReadAll(r.Body)
-		require.NoError(t, err)
-		assert.Equal(t, `{"type":"TXT","name":"_acme-challenge","content":"w6uP8Tcg6K2QR905Rms8iXTlksL6OD1KOWBxTK7wxPI","ttl":300}`, string(reqBody))
-
-		w.WriteHeader(http.StatusCreated)
-		fmt.Fprintf(w, `{
-		      "id":   "c56a4180-65aa-42ec-a945-5fd21dec0538",
-		      "type": "TXT",
-		      "name": "_acme-challenge",
-		      "ttl":  300
-		    }`)
-	})
+	provider := mockBuilder().
+		Route("GET /zones",
+			servermock.JSONEncode([]auroradns.Zone{{
+				ID:   "c56a4180-65aa-42ec-a945-5fd21dec0538",
+				Name: "example.com",
+			}}).
+				WithStatusCode(http.StatusCreated)).
+		Route("POST /zones/c56a4180-65aa-42ec-a945-5fd21dec0538/records",
+			servermock.JSONEncode(auroradns.Record{
+				ID:         "ec56a4180-65aa-42ec-a945-5fd21dec0538",
+				RecordType: "TXT",
+				Name:       "_acme-challenge",
+				TTL:        300,
+			}).
+				WithStatusCode(http.StatusCreated)).
+		Build(t)
 
 	err := provider.Present("example.com", "", "foobar")
-	require.NoError(t, err, "fail to create TXT record")
+	require.NoError(t, err)
 }
 
 func TestDNSProvider_CleanUp(t *testing.T) {
-	provider, mux, tearDown := setupTest()
-	defer tearDown()
-
-	mux.HandleFunc("/zones", func(w http.ResponseWriter, r *http.Request) {
-		assert.Equal(t, http.MethodGet, r.Method)
-
-		w.WriteHeader(http.StatusCreated)
-		fmt.Fprintf(w, `[{
-			        "id":   "c56a4180-65aa-42ec-a945-5fd21dec0538",
-			        "name": "example.com"
-			      }]`)
-	})
-
-	mux.HandleFunc("/zones/c56a4180-65aa-42ec-a945-5fd21dec0538/records", func(w http.ResponseWriter, r *http.Request) {
-		assert.Equal(t, http.MethodPost, r.Method)
-
-		w.WriteHeader(http.StatusCreated)
-		fmt.Fprintf(w, `{
-			        "id":   "ec56a4180-65aa-42ec-a945-5fd21dec0538",
-			        "type": "TXT",
-			        "name": "_acme-challenge",
-			        "ttl":  300
-			      }`)
-	})
-
-	mux.HandleFunc("/zones/c56a4180-65aa-42ec-a945-5fd21dec0538/records/ec56a4180-65aa-42ec-a945-5fd21dec0538", func(w http.ResponseWriter, r *http.Request) {
-		assert.Equal(t, http.MethodDelete, r.Method)
-
-		assert.Equal(t, "application/json", r.Header.Get("Content-Type"), "Content-Type")
-
-		w.WriteHeader(http.StatusCreated)
-		fmt.Fprintf(w, `{}`)
-	})
+	provider := mockBuilder().
+		Route("GET /zones",
+			servermock.JSONEncode([]auroradns.Zone{{
+				ID:   "c56a4180-65aa-42ec-a945-5fd21dec0538",
+				Name: "example.com",
+			}}).
+				WithStatusCode(http.StatusCreated)).
+		Route("POST /zones/c56a4180-65aa-42ec-a945-5fd21dec0538/records",
+			servermock.JSONEncode(auroradns.Record{
+				ID:         "ec56a4180-65aa-42ec-a945-5fd21dec0538",
+				RecordType: "TXT",
+				Name:       "_acme-challenge",
+				TTL:        300,
+			}).
+				WithStatusCode(http.StatusCreated)).
+		Route("DELETE /zones/c56a4180-65aa-42ec-a945-5fd21dec0538/records/ec56a4180-65aa-42ec-a945-5fd21dec0538",
+			servermock.RawStringResponse("{}").
+				WithStatusCode(http.StatusCreated)).
+		Build(t)
 
 	err := provider.Present("example.com", "", "foobar")
-	require.NoError(t, err, "fail to create TXT record")
+	require.NoError(t, err)
 
 	err = provider.CleanUp("example.com", "", "foobar")
-	require.NoError(t, err, "fail to remove TXT record")
+	require.NoError(t, err)
 }

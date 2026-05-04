@@ -2,19 +2,22 @@ package resolver
 
 import (
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/go-acme/lego/v4/acme"
 	"github.com/go-acme/lego/v4/challenge"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 func TestProber_Solve(t *testing.T) {
 	testCases := []struct {
-		desc          string
-		solvers       map[challenge.Type]solver
-		authz         []acme.Authorization
-		expectedError string
+		desc             string
+		solvers          map[challenge.Type]solver
+		authz            []acme.Authorization
+		expectedError    string
+		expectedCounters map[challenge.Type]string
 	}{
 		{
 			desc: "success",
@@ -26,9 +29,33 @@ func TestProber_Solve(t *testing.T) {
 				},
 			},
 			authz: []acme.Authorization{
-				createStubAuthorizationHTTP01("acme.wtf", acme.StatusProcessing),
-				createStubAuthorizationHTTP01("lego.wtf", acme.StatusProcessing),
-				createStubAuthorizationHTTP01("mydomain.wtf", acme.StatusProcessing),
+				createStubAuthorizationHTTP01("example.com", acme.StatusProcessing),
+				createStubAuthorizationHTTP01("example.org", acme.StatusProcessing),
+				createStubAuthorizationHTTP01("example.net", acme.StatusProcessing),
+			},
+			expectedCounters: map[challenge.Type]string{
+				challenge.HTTP01: "PreSolve: 3, Solve: 3, CleanUp: 3",
+			},
+		},
+		{
+			desc: "DNS-01 deduplicate",
+			solvers: map[challenge.Type]solver{
+				challenge.DNS01: &preSolverMock{
+					preSolve: map[string]error{},
+					solve:    map[string]error{},
+					cleanUp:  map[string]error{},
+				},
+			},
+			authz: []acme.Authorization{
+				createStubAuthorizationDNS01("a.example", false),
+				createStubAuthorizationDNS01("a.example", true),
+				createStubAuthorizationDNS01("b.example", false),
+				createStubAuthorizationDNS01("b.example", true),
+				createStubAuthorizationDNS01("c.example", true),
+				createStubAuthorizationDNS01("d.example", false),
+			},
+			expectedCounters: map[challenge.Type]string{
+				challenge.DNS01: "PreSolve: 4, Solve: 6, CleanUp: 4",
 			},
 		},
 		{
@@ -41,9 +68,12 @@ func TestProber_Solve(t *testing.T) {
 				},
 			},
 			authz: []acme.Authorization{
-				createStubAuthorizationHTTP01("acme.wtf", acme.StatusValid),
-				createStubAuthorizationHTTP01("lego.wtf", acme.StatusValid),
-				createStubAuthorizationHTTP01("mydomain.wtf", acme.StatusValid),
+				createStubAuthorizationHTTP01("example.com", acme.StatusValid),
+				createStubAuthorizationHTTP01("example.org", acme.StatusValid),
+				createStubAuthorizationHTTP01("example.net", acme.StatusValid),
+			},
+			expectedCounters: map[challenge.Type]string{
+				challenge.HTTP01: "PreSolve: 0, Solve: 0, CleanUp: 0",
 			},
 		},
 		{
@@ -51,55 +81,60 @@ func TestProber_Solve(t *testing.T) {
 			solvers: map[challenge.Type]solver{
 				challenge.HTTP01: &preSolverMock{
 					preSolve: map[string]error{
-						"acme.wtf": errors.New("preSolve error acme.wtf"),
+						"example.com": errors.New("preSolve error example.com"),
 					},
 					solve: map[string]error{
-						"acme.wtf": errors.New("solve error acme.wtf"),
+						"example.com": errors.New("solve error example.com"),
 					},
 					cleanUp: map[string]error{
-						"acme.wtf": errors.New("clean error acme.wtf"),
+						"example.com": errors.New("clean error example.com"),
 					},
 				},
 			},
 			authz: []acme.Authorization{
-				createStubAuthorizationHTTP01("acme.wtf", acme.StatusProcessing),
-				createStubAuthorizationHTTP01("lego.wtf", acme.StatusProcessing),
-				createStubAuthorizationHTTP01("mydomain.wtf", acme.StatusProcessing),
+				createStubAuthorizationHTTP01("example.com", acme.StatusProcessing),
+				createStubAuthorizationHTTP01("example.org", acme.StatusProcessing),
+				createStubAuthorizationHTTP01("example.net", acme.StatusProcessing),
 			},
 			expectedError: `error: one or more domains had a problem:
-[acme.wtf] preSolve error acme.wtf
+[example.com] preSolve error example.com
 `,
+			expectedCounters: map[challenge.Type]string{
+				challenge.HTTP01: "PreSolve: 3, Solve: 2, CleanUp: 3",
+			},
 		},
 		{
 			desc: "errors at different stages",
 			solvers: map[challenge.Type]solver{
 				challenge.HTTP01: &preSolverMock{
 					preSolve: map[string]error{
-						"acme.wtf": errors.New("preSolve error acme.wtf"),
+						"example.com": errors.New("preSolve error example.com"),
 					},
 					solve: map[string]error{
-						"acme.wtf": errors.New("solve error acme.wtf"),
-						"lego.wtf": errors.New("solve error lego.wtf"),
+						"example.com": errors.New("solve error example.com"),
+						"example.org": errors.New("solve error example.org"),
 					},
 					cleanUp: map[string]error{
-						"mydomain.wtf": errors.New("clean error mydomain.wtf"),
+						"example.net": errors.New("clean error example.net"),
 					},
 				},
 			},
 			authz: []acme.Authorization{
-				createStubAuthorizationHTTP01("acme.wtf", acme.StatusProcessing),
-				createStubAuthorizationHTTP01("lego.wtf", acme.StatusProcessing),
-				createStubAuthorizationHTTP01("mydomain.wtf", acme.StatusProcessing),
+				createStubAuthorizationHTTP01("example.com", acme.StatusProcessing),
+				createStubAuthorizationHTTP01("example.org", acme.StatusProcessing),
+				createStubAuthorizationHTTP01("example.net", acme.StatusProcessing),
 			},
 			expectedError: `error: one or more domains had a problem:
-[acme.wtf] preSolve error acme.wtf
-[lego.wtf] solve error lego.wtf
+[example.com] preSolve error example.com
+[example.org] solve error example.org
 `,
+			expectedCounters: map[challenge.Type]string{
+				challenge.HTTP01: "PreSolve: 3, Solve: 2, CleanUp: 3",
+			},
 		},
 	}
 
 	for _, test := range testCases {
-		test := test
 		t.Run(test.desc, func(t *testing.T) {
 			t.Parallel()
 
@@ -112,6 +147,10 @@ func TestProber_Solve(t *testing.T) {
 				require.EqualError(t, err, test.expectedError)
 			} else {
 				require.NoError(t, err)
+			}
+
+			for n, s := range test.solvers {
+				assert.Equal(t, test.expectedCounters[n], fmt.Sprintf("%s", s))
 			}
 		})
 	}

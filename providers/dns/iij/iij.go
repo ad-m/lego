@@ -4,14 +4,16 @@ package iij
 import (
 	"errors"
 	"fmt"
+	"slices"
 	"strconv"
-	"strings"
 	"time"
 
+	"github.com/go-acme/lego/v4/challenge"
 	"github.com/go-acme/lego/v4/challenge/dns01"
 	"github.com/go-acme/lego/v4/platform/config/env"
 	"github.com/iij/doapi"
 	"github.com/iij/doapi/protocol"
+	"github.com/miekg/dns"
 )
 
 // Environment variables names.
@@ -26,6 +28,8 @@ const (
 	EnvPropagationTimeout = envNamespace + "PROPAGATION_TIMEOUT"
 	EnvPollingInterval    = envNamespace + "POLLING_INTERVAL"
 )
+
+var _ challenge.ProviderTimeout = (*DNSProvider)(nil)
 
 // Config is used to configure the creation of the DNSProvider.
 type Config struct {
@@ -87,23 +91,27 @@ func (d *DNSProvider) Timeout() (timeout, interval time.Duration) {
 
 // Present creates a TXT record using the specified parameters.
 func (d *DNSProvider) Present(domain, token, keyAuth string) error {
-	_, value := dns01.GetRecord(domain, keyAuth)
+	info := dns01.GetChallengeInfo(domain, keyAuth)
 
-	err := d.addTxtRecord(domain, value)
+	// TODO(ldez) replace domain by FQDN to follow CNAME.
+	err := d.addTxtRecord(domain, info.Value)
 	if err != nil {
 		return fmt.Errorf("iij: %w", err)
 	}
+
 	return nil
 }
 
 // CleanUp removes the TXT record matching the specified parameters.
 func (d *DNSProvider) CleanUp(domain, token, keyAuth string) error {
-	_, value := dns01.GetRecord(domain, keyAuth)
+	info := dns01.GetChallengeInfo(domain, keyAuth)
 
-	err := d.deleteTxtRecord(domain, value)
+	// TODO(ldez) replace domain by FQDN to follow CNAME.
+	err := d.deleteTxtRecord(domain, info.Value)
 	if err != nil {
 		return fmt.Errorf("iij: %w", err)
 	}
+
 	return nil
 }
 
@@ -113,6 +121,7 @@ func (d *DNSProvider) addTxtRecord(domain, value string) error {
 		return err
 	}
 
+	// TODO(ldez) replace domain by FQDN to follow CNAME.
 	owner, zone, err := splitDomain(domain, zones)
 	if err != nil {
 		return err
@@ -219,35 +228,20 @@ func (d *DNSProvider) listZones() ([]string, error) {
 }
 
 func splitDomain(domain string, zones []string) (string, string, error) {
-	parts := strings.Split(strings.Trim(domain, "."), ".")
+	base := dns01.UnFqdn(domain)
 
-	var owner string
-	var zone string
+	for _, index := range dns.Split(base) {
+		zone := base[index:]
 
-	for i := 0; i < len(parts)-1; i++ {
-		zone = strings.Join(parts[i:], ".")
-		if zoneContains(zone, zones) {
-			baseOwner := strings.Join(parts[0:i], ".")
-			if len(baseOwner) > 0 {
+		if slices.Contains(zones, zone) {
+			baseOwner := base[:index]
+			if baseOwner != "" {
 				baseOwner = "." + baseOwner
 			}
-			owner = "_acme-challenge" + baseOwner
-			break
+
+			return "_acme-challenge" + dns01.UnFqdn(baseOwner), zone, nil
 		}
 	}
 
-	if owner == "" {
-		return "", "", fmt.Errorf("%s not found", domain)
-	}
-
-	return owner, zone, nil
-}
-
-func zoneContains(zone string, zones []string) bool {
-	for _, z := range zones {
-		if zone == z {
-			return true
-		}
-	}
-	return false
+	return "", "", fmt.Errorf("%s not found", domain)
 }

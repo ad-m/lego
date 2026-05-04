@@ -20,7 +20,7 @@ func TestNewDNSProvider(t *testing.T) {
 	testCases := []struct {
 		desc     string
 		envVars  map[string]string
-		expected interface{}
+		expected any
 	}{
 		{
 			desc: "mode DMAPI (default)",
@@ -53,6 +53,7 @@ func TestNewDNSProvider(t *testing.T) {
 	for _, test := range testCases {
 		t.Run(test.desc, func(t *testing.T) {
 			defer envTest.RestoreEnv()
+
 			envTest.ClearEnv()
 
 			envTest.Apply(test.envVars)
@@ -72,7 +73,7 @@ func TestNewDNSProviderConfig(t *testing.T) {
 	testCases := []struct {
 		desc     string
 		mode     string
-		expected interface{}
+		expected any
 	}{
 		{
 			desc:     "mode DMAPI (default)",
@@ -112,6 +113,7 @@ func TestLivePresent(t *testing.T) {
 	}
 
 	envTest.RestoreEnv()
+
 	provider, err := NewDNSProvider()
 	require.NoError(t, err)
 
@@ -125,6 +127,7 @@ func TestLiveCleanUp(t *testing.T) {
 	}
 
 	envTest.RestoreEnv()
+
 	provider, err := NewDNSProvider()
 	require.NoError(t, err)
 

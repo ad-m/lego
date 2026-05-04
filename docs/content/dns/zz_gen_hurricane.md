@@ -3,13 +3,16 @@ title: "Hurricane Electric DNS"
 date: 2019-03-03T16:39:46+01:00
 draft: false
 slug: hurricane
+dnsprovider:
+  since:    "v4.3.0"
+  code:     "hurricane"
+  url:      "https://dns.he.net/"
 ---
 
 <!-- THIS DOCUMENTATION IS AUTO-GENERATED. PLEASE DO NOT EDIT. -->
 <!-- providers/dns/hurricane/hurricane.toml -->
 <!-- THIS DOCUMENTATION IS AUTO-GENERATED. PLEASE DO NOT EDIT. -->
 
-Since: v4.3.0
 
 Configuration for [Hurricane Electric DNS](https://dns.he.net/).
 
@@ -17,15 +20,17 @@ Configuration for [Hurricane Electric DNS](https://dns.he.net/).
 <!--more-->
 
 - Code: `hurricane`
+- Since: v4.3.0
+
 
 Here is an example bash command using the Hurricane Electric DNS provider:
 
 ```bash
 HURRICANE_TOKENS=example.org:token \
-lego --email myemail@example.com --dns hurricane -d example.org -d *.example.org run
+lego --dns hurricane -d '*.example.com' -d example.com run
 
 HURRICANE_TOKENS=my.example.org:token1,demo.example.org:token2 \
-lego -m myemail@example.com --dns hurricane -d my.example.org -d demo.example.org
+lego --dns hurricane -d my.example.org -d demo.example.org
 ```
 
 
@@ -38,9 +43,20 @@ lego -m myemail@example.com --dns hurricane -d my.example.org -d demo.example.or
 | `HURRICANE_TOKENS` | TXT record names and tokens |
 
 The environment variable names can be suffixed by `_FILE` to reference a file instead of a value.
-More information [here](/lego/dns/#configuration-and-credentials).
+More information [here]({{% ref "dns#configuration-and-credentials" %}}).
 
 
+## Additional Configuration
+
+| Environment Variable Name | Description |
+|--------------------------------|-------------|
+| `HURRICANE_HTTP_TIMEOUT` | API request timeout in seconds (Default: 30) |
+| `HURRICANE_POLLING_INTERVAL` | Time between DNS propagation check in seconds (Default: 2) |
+| `HURRICANE_PROPAGATION_TIMEOUT` | Maximum waiting time for DNS propagation (Default: 300) |
+| `HURRICANE_SEQUENCE_INTERVAL` | Time between sequential requests in seconds (Default: 60) |
+
+The environment variable names can be suffixed by `_FILE` to reference a file instead of a value.
+More information [here]({{% ref "dns#configuration-and-credentials" %}}).
 
 Before using lego to request a certificate for a given domain or wildcard (such as `my.example.org` or `*.my.example.org`),
 create a TXT record named `_acme-challenge.my.example.org`, and enable dynamic updates on it.
@@ -67,7 +83,7 @@ HURRICANE_TOKENS=example.org:token
 
 ## More information
 
-- [API documentation](https://dns.he.org/)
+- [API documentation](https://dns.he.net/)
 
 <!-- THIS DOCUMENTATION IS AUTO-GENERATED. PLEASE DO NOT EDIT. -->
 <!-- providers/dns/hurricane/hurricane.toml -->

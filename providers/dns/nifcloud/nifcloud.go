@@ -2,14 +2,19 @@
 package nifcloud
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"time"
 
+	"github.com/cenkalti/backoff/v5"
+	"github.com/go-acme/lego/v4/challenge"
 	"github.com/go-acme/lego/v4/challenge/dns01"
 	"github.com/go-acme/lego/v4/platform/config/env"
 	"github.com/go-acme/lego/v4/platform/wait"
+	"github.com/go-acme/lego/v4/providers/dns/internal/clientdebug"
 	"github.com/go-acme/lego/v4/providers/dns/nifcloud/internal"
 )
 
@@ -26,6 +31,8 @@ const (
 	EnvPollingInterval    = envNamespace + "POLLING_INTERVAL"
 	EnvHTTPTimeout        = envNamespace + "HTTP_TIMEOUT"
 )
+
+var _ challenge.ProviderTimeout = (*DNSProvider)(nil)
 
 // Config is used to configure the creation of the DNSProvider.
 type Config struct {
@@ -88,8 +95,15 @@ func NewDNSProviderConfig(config *Config) (*DNSProvider, error) {
 		client.HTTPClient = config.HTTPClient
 	}
 
-	if len(config.BaseURL) > 0 {
-		client.BaseURL = config.BaseURL
+	client.HTTPClient = clientdebug.Wrap(client.HTTPClient)
+
+	if config.BaseURL != "" {
+		baseURL, err := url.Parse(config.BaseURL)
+		if err != nil {
+			return nil, fmt.Errorf("nifcloud: %w", err)
+		}
+
+		client.BaseURL = baseURL
 	}
 
 	return &DNSProvider{client: client, config: config}, nil
@@ -97,23 +111,29 @@ func NewDNSProviderConfig(config *Config) (*DNSProvider, error) {
 
 // Present creates a TXT record using the specified parameters.
 func (d *DNSProvider) Present(domain, token, keyAuth string) error {
-	fqdn, value := dns01.GetRecord(domain, keyAuth)
+	ctx := context.Background()
 
-	err := d.changeRecord("CREATE", fqdn, value, d.config.TTL)
+	info := dns01.GetChallengeInfo(domain, keyAuth)
+
+	err := d.changeRecord(ctx, "CREATE", info.EffectiveFQDN, info.Value, d.config.TTL)
 	if err != nil {
 		return fmt.Errorf("nifcloud: %w", err)
 	}
+
 	return err
 }
 
 // CleanUp removes the TXT record matching the specified parameters.
 func (d *DNSProvider) CleanUp(domain, token, keyAuth string) error {
-	fqdn, value := dns01.GetRecord(domain, keyAuth)
+	ctx := context.Background()
 
-	err := d.changeRecord("DELETE", fqdn, value, d.config.TTL)
+	info := dns01.GetChallengeInfo(domain, keyAuth)
+
+	err := d.changeRecord(ctx, "DELETE", info.EffectiveFQDN, info.Value, d.config.TTL)
 	if err != nil {
 		return fmt.Errorf("nifcloud: %w", err)
 	}
+
 	return err
 }
 
@@ -123,8 +143,16 @@ func (d *DNSProvider) Timeout() (timeout, interval time.Duration) {
 	return d.config.PropagationTimeout, d.config.PollingInterval
 }
 
-func (d *DNSProvider) changeRecord(action, fqdn, value string, ttl int) error {
+func (d *DNSProvider) changeRecord(ctx context.Context, action, fqdn, value string, ttl int) error {
+	authZone, err := dns01.FindZoneByFqdn(fqdn)
+	if err != nil {
+		return fmt.Errorf("could not find zone: %w", err)
+	}
+
 	name := dns01.UnFqdn(fqdn)
+	if authZone == fqdn {
+		name = "@"
+	}
 
 	reqParams := internal.ChangeResourceRecordSetsRequest{
 		XMLNs: internal.XMLNs,
@@ -152,23 +180,27 @@ func (d *DNSProvider) changeRecord(action, fqdn, value string, ttl int) error {
 		},
 	}
 
-	authZone, err := dns01.FindZoneByFqdn(fqdn)
-	if err != nil {
-		return fmt.Errorf("failed to find zone: %w", err)
-	}
-
-	resp, err := d.client.ChangeResourceRecordSets(dns01.UnFqdn(authZone), reqParams)
+	resp, err := d.client.ChangeResourceRecordSets(ctx, dns01.UnFqdn(authZone), reqParams)
 	if err != nil {
 		return fmt.Errorf("failed to change record set: %w", err)
 	}
 
 	statusID := resp.ChangeInfo.ID
 
-	return wait.For("nifcloud", 120*time.Second, 4*time.Second, func() (bool, error) {
-		resp, err := d.client.GetChange(statusID)
-		if err != nil {
-			return false, fmt.Errorf("failed to query change status: %w", err)
-		}
-		return resp.ChangeInfo.Status == "INSYNC", nil
-	})
+	return wait.Retry(ctx,
+		func() error {
+			resp, err := d.client.GetChange(ctx, statusID)
+			if err != nil {
+				return fmt.Errorf("get change: %w", err)
+			}
+
+			if resp.ChangeInfo.Status != "INSYNC" {
+				return fmt.Errorf("change status: %s", resp.ChangeInfo.Status)
+			}
+
+			return nil
+		},
+		backoff.WithBackOff(backoff.NewConstantBackOff(4*time.Second)),
+		backoff.WithMaxElapsedTime(120*time.Second),
+	)
 }

@@ -2,14 +2,22 @@
 package sakuracloud
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
+	"github.com/go-acme/lego/v4/challenge"
 	"github.com/go-acme/lego/v4/challenge/dns01"
 	"github.com/go-acme/lego/v4/platform/config/env"
-	"github.com/sacloud/libsacloud/api"
+	"github.com/go-acme/lego/v4/providers/dns/internal/clientdebug"
+	"github.com/go-acme/lego/v4/providers/dns/internal/useragent"
+	client "github.com/sacloud/api-client-go"
+	"github.com/sacloud/iaas-api-go"
+	"github.com/sacloud/iaas-api-go/defaults"
+	"github.com/sacloud/iaas-api-go/helper/api"
 )
 
 // Environment variables names.
@@ -24,6 +32,8 @@ const (
 	EnvPollingInterval    = envNamespace + "POLLING_INTERVAL"
 	EnvHTTPTimeout        = envNamespace + "HTTP_TIMEOUT"
 )
+
+var _ challenge.ProviderTimeout = (*DNSProvider)(nil)
 
 // Config is used to configure the creation of the DNSProvider.
 type Config struct {
@@ -50,7 +60,7 @@ func NewDefaultConfig() *Config {
 // DNSProvider implements the challenge.Provider interface.
 type DNSProvider struct {
 	config *Config
-	client *api.DNSAPI
+	client iaas.DNSAPI
 }
 
 // NewDNSProvider returns a DNSProvider instance configured for SakuraCloud.
@@ -83,33 +93,87 @@ func NewDNSProviderConfig(config *Config) (*DNSProvider, error) {
 		return nil, errors.New("sakuracloud: AccessSecret is missing")
 	}
 
-	apiClient := api.NewClient(config.Token, config.Secret, "is1a")
-	if config.HTTPClient == nil {
-		apiClient.HTTPClient = http.DefaultClient
-	} else {
-		apiClient.HTTPClient = config.HTTPClient
+	defaultOption, err := api.DefaultOption()
+	if err != nil {
+		return nil, fmt.Errorf("sakuracloud: %w", err)
+	}
+
+	options := &api.CallerOptions{
+		Options: &client.Options{
+			AccessToken:       config.Token,
+			AccessTokenSecret: config.Secret,
+			HttpClient:        clientdebug.Wrap(config.HTTPClient),
+			UserAgent:         fmt.Sprintf("%s %s", iaas.DefaultUserAgent, useragent.Get()),
+		},
 	}
 
 	return &DNSProvider{
-		client: apiClient.GetDNSAPI(),
+		client: iaas.NewDNSOp(newCallerWithOptions(api.MergeOptions(defaultOption, options))),
 		config: config,
 	}, nil
 }
 
 // Present creates a TXT record to fulfill the dns-01 challenge.
 func (d *DNSProvider) Present(domain, token, keyAuth string) error {
-	fqdn, value := dns01.GetRecord(domain, keyAuth)
-	return d.addTXTRecord(fqdn, domain, value, d.config.TTL)
+	info := dns01.GetChallengeInfo(domain, keyAuth)
+
+	err := d.addTXTRecord(context.Background(), info.EffectiveFQDN, info.Value, d.config.TTL)
+	if err != nil {
+		return fmt.Errorf("sakuracloud: %w", err)
+	}
+
+	return nil
 }
 
 // CleanUp removes the TXT record matching the specified parameters.
 func (d *DNSProvider) CleanUp(domain, token, keyAuth string) error {
-	fqdn, _ := dns01.GetRecord(domain, keyAuth)
-	return d.cleanupTXTRecord(fqdn, domain)
+	info := dns01.GetChallengeInfo(domain, keyAuth)
+
+	err := d.cleanupTXTRecord(context.Background(), info.EffectiveFQDN, info.Value)
+	if err != nil {
+		return fmt.Errorf("sakuracloud: %w", err)
+	}
+
+	return nil
 }
 
 // Timeout returns the timeout and interval to use when checking for DNS propagation.
 // Adjusting here to cope with spikes in propagation times.
 func (d *DNSProvider) Timeout() (timeout, interval time.Duration) {
 	return d.config.PropagationTimeout, d.config.PollingInterval
+}
+
+// Extracted from https://github.com/sacloud/iaas-api-go/blob/af06b3ccc2c38625d2dc684ad39590d0ae13eed3/helper/api/caller.go#L36-L81
+// Trace and fake are removed.
+// Related to https://github.com/sacloud/iaas-api-go/issues/376.
+func newCallerWithOptions(opts *api.CallerOptions) iaas.APICaller {
+	return newCaller(opts)
+}
+
+func newCaller(opts *api.CallerOptions) iaas.APICaller {
+	if opts.UserAgent == "" {
+		opts.UserAgent = iaas.DefaultUserAgent
+	}
+
+	caller := iaas.NewClientWithOptions(opts.Options)
+
+	defaults.DefaultStatePollingTimeout = 72 * time.Hour
+
+	if opts.DefaultZone != "" {
+		iaas.APIDefaultZone = opts.DefaultZone
+	}
+
+	if len(opts.Zones) > 0 {
+		iaas.SakuraCloudZones = opts.Zones
+	}
+
+	if opts.APIRootURL != "" {
+		if strings.HasSuffix(opts.APIRootURL, "/") {
+			opts.APIRootURL = strings.TrimRight(opts.APIRootURL, "/")
+		}
+
+		iaas.SakuraCloudAPIRoot = opts.APIRootURL
+	}
+
+	return caller
 }

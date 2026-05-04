@@ -2,14 +2,17 @@
 package clouddns
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
 	"time"
 
+	"github.com/go-acme/lego/v4/challenge"
 	"github.com/go-acme/lego/v4/challenge/dns01"
 	"github.com/go-acme/lego/v4/platform/config/env"
 	"github.com/go-acme/lego/v4/providers/dns/clouddns/internal"
+	"github.com/go-acme/lego/v4/providers/dns/internal/clientdebug"
 )
 
 // Environment variables names.
@@ -25,6 +28,8 @@ const (
 	EnvPollingInterval    = envNamespace + "POLLING_INTERVAL"
 	EnvHTTPTimeout        = envNamespace + "HTTP_TIMEOUT"
 )
+
+var _ challenge.ProviderTimeout = (*DNSProvider)(nil)
 
 // Config is used to configure the DNSProvider.
 type Config struct {
@@ -89,10 +94,9 @@ func NewDNSProviderConfig(config *Config) (*DNSProvider, error) {
 		client.HTTPClient = config.HTTPClient
 	}
 
-	return &DNSProvider{
-		client: client,
-		config: config,
-	}, nil
+	client.HTTPClient = clientdebug.Wrap(client.HTTPClient)
+
+	return &DNSProvider{client: client, config: config}, nil
 }
 
 // Timeout returns the timeout and interval to use when checking for DNS propagation.
@@ -103,16 +107,21 @@ func (d *DNSProvider) Timeout() (timeout, interval time.Duration) {
 
 // Present creates a TXT record using the specified parameters.
 func (d *DNSProvider) Present(domain, token, keyAuth string) error {
-	fqdn, value := dns01.GetRecord(domain, keyAuth)
+	info := dns01.GetChallengeInfo(domain, keyAuth)
 
-	authZone, err := dns01.FindZoneByFqdn(fqdn)
+	authZone, err := dns01.FindZoneByFqdn(info.EffectiveFQDN)
 	if err != nil {
-		return fmt.Errorf("clouddns: %w", err)
+		return fmt.Errorf("clouddns: could not find zone for domain %q: %w", domain, err)
 	}
 
-	err = d.client.AddRecord(authZone, fqdn, value)
+	ctx, err := d.client.CreateAuthenticatedContext(context.Background())
 	if err != nil {
-		return fmt.Errorf("clouddns: %w", err)
+		return err
+	}
+
+	err = d.client.AddRecord(ctx, authZone, info.EffectiveFQDN, info.Value)
+	if err != nil {
+		return fmt.Errorf("clouddns: add record: %w", err)
 	}
 
 	return nil
@@ -120,16 +129,21 @@ func (d *DNSProvider) Present(domain, token, keyAuth string) error {
 
 // CleanUp removes the TXT record matching the specified parameters.
 func (d *DNSProvider) CleanUp(domain, token, keyAuth string) error {
-	fqdn, _ := dns01.GetRecord(domain, keyAuth)
+	info := dns01.GetChallengeInfo(domain, keyAuth)
 
-	authZone, err := dns01.FindZoneByFqdn(fqdn)
+	authZone, err := dns01.FindZoneByFqdn(info.EffectiveFQDN)
 	if err != nil {
-		return fmt.Errorf("clouddns: %w", err)
+		return fmt.Errorf("clouddns: could not find zone for domain %q: %w", domain, err)
 	}
 
-	err = d.client.DeleteRecord(authZone, fqdn)
+	ctx, err := d.client.CreateAuthenticatedContext(context.Background())
 	if err != nil {
-		return fmt.Errorf("clouddns: %w", err)
+		return err
+	}
+
+	err = d.client.DeleteRecord(ctx, authZone, info.EffectiveFQDN)
+	if err != nil {
+		return fmt.Errorf("clouddns: delete record: %w", err)
 	}
 
 	return nil

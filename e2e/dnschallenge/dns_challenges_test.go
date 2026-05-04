@@ -18,6 +18,11 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+const (
+	testDomain1 = "légo.localhost"
+	testDomain2 = "*.légo.localhost"
+)
+
 var load = loader.EnvLoader{
 	PebbleOptions: &loader.CmdOption{
 		HealthCheckURL: "https://localhost:15000/dir",
@@ -28,6 +33,7 @@ var load = loader.EnvLoader{
 	LegoOptions: []string{
 		"LEGO_CA_CERTIFICATES=../fixtures/certs/pebble.minica.pem",
 		"EXEC_PATH=../fixtures/update-dns.sh",
+		"LEGO_DEBUG_ACME_HTTP_CLIENT=1",
 	},
 	ChallSrv: &loader.CmdOption{
 		Args: []string{"-http01", ":5012", "-tlsalpn01", ":5011"},
@@ -39,7 +45,7 @@ func TestMain(m *testing.M) {
 }
 
 func TestDNSHelp(t *testing.T) {
-	output, err := load.RunLego("dnshelp")
+	output, err := load.RunLegoCombinedOutput("dnshelp")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%s\n", output)
 		t.Fatal(err)
@@ -51,20 +57,15 @@ func TestDNSHelp(t *testing.T) {
 func TestChallengeDNS_Run(t *testing.T) {
 	loader.CleanLegoFiles()
 
-	output, err := load.RunLego(
-		"-m", "hubert@hubert.com",
+	err := load.RunLego(
 		"--accept-tos",
 		"--dns", "exec",
 		"--dns.resolvers", ":8053",
 		"--dns.disable-cp",
 		"-s", "https://localhost:15000/dir",
-		"-d", "*.légo.acme",
-		"-d", "légo.acme",
+		"-d", testDomain2,
+		"-d", testDomain1,
 		"run")
-
-	if len(output) > 0 {
-		fmt.Fprintf(os.Stdout, "%s\n", output)
-	}
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -73,10 +74,12 @@ func TestChallengeDNS_Run(t *testing.T) {
 func TestChallengeDNS_Client_Obtain(t *testing.T) {
 	err := os.Setenv("LEGO_CA_CERTIFICATES", "../fixtures/certs/pebble.minica.pem")
 	require.NoError(t, err)
+
 	defer func() { _ = os.Unsetenv("LEGO_CA_CERTIFICATES") }()
 
 	err = os.Setenv("EXEC_PATH", "../fixtures/update-dns.sh")
 	require.NoError(t, err)
+
 	defer func() { _ = os.Unsetenv("EXEC_PATH") }()
 
 	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
@@ -94,14 +97,15 @@ func TestChallengeDNS_Client_Obtain(t *testing.T) {
 
 	err = client.Challenge.SetDNS01Provider(provider,
 		dns01.AddRecursiveNameservers([]string{":8053"}),
-		dns01.DisableCompletePropagationRequirement())
+		dns01.DisableAuthoritativeNssPropagationRequirement())
 	require.NoError(t, err)
 
 	reg, err := client.Registration.Register(registration.RegisterOptions{TermsOfServiceAgreed: true})
 	require.NoError(t, err)
+
 	user.registration = reg
 
-	domains := []string{"*.légo.acme", "légo.acme"}
+	domains := []string{testDomain2, testDomain1}
 
 	// https://github.com/letsencrypt/pebble/issues/285
 	privateKeyCSR, err := rsa.GenerateKey(rand.Reader, 2048)
@@ -116,7 +120,65 @@ func TestChallengeDNS_Client_Obtain(t *testing.T) {
 	require.NoError(t, err)
 
 	require.NotNil(t, resource)
-	assert.Equal(t, "*.xn--lgo-bma.acme", resource.Domain)
+	assert.Equal(t, "*.xn--lgo-bma.localhost", resource.Domain)
+	assert.Regexp(t, `https://localhost:15000/certZ/[\w\d]{14,}`, resource.CertURL)
+	assert.Regexp(t, `https://localhost:15000/certZ/[\w\d]{14,}`, resource.CertStableURL)
+	assert.NotEmpty(t, resource.Certificate)
+	assert.NotEmpty(t, resource.IssuerCertificate)
+	assert.Empty(t, resource.CSR)
+}
+
+func TestChallengeDNS_Client_Obtain_profile(t *testing.T) {
+	err := os.Setenv("LEGO_CA_CERTIFICATES", "../fixtures/certs/pebble.minica.pem")
+	require.NoError(t, err)
+
+	defer func() { _ = os.Unsetenv("LEGO_CA_CERTIFICATES") }()
+
+	err = os.Setenv("EXEC_PATH", "../fixtures/update-dns.sh")
+	require.NoError(t, err)
+
+	defer func() { _ = os.Unsetenv("EXEC_PATH") }()
+
+	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err, "Could not generate test key")
+
+	user := &fakeUser{privateKey: privateKey}
+	config := lego.NewConfig(user)
+	config.CADirURL = "https://localhost:15000/dir"
+
+	client, err := lego.NewClient(config)
+	require.NoError(t, err)
+
+	provider, err := dns.NewDNSChallengeProviderByName("exec")
+	require.NoError(t, err)
+
+	err = client.Challenge.SetDNS01Provider(provider,
+		dns01.AddRecursiveNameservers([]string{":8053"}),
+		dns01.DisableAuthoritativeNssPropagationRequirement())
+	require.NoError(t, err)
+
+	reg, err := client.Registration.Register(registration.RegisterOptions{TermsOfServiceAgreed: true})
+	require.NoError(t, err)
+
+	user.registration = reg
+
+	domains := []string{testDomain2, testDomain1}
+
+	// https://github.com/letsencrypt/pebble/issues/285
+	privateKeyCSR, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err, "Could not generate test key")
+
+	request := certificate.ObtainRequest{
+		Domains:    domains,
+		Bundle:     true,
+		PrivateKey: privateKeyCSR,
+		Profile:    "shortlived",
+	}
+	resource, err := client.Certificate.Obtain(request)
+	require.NoError(t, err)
+
+	require.NotNil(t, resource)
+	assert.Equal(t, "*.xn--lgo-bma.localhost", resource.Domain)
 	assert.Regexp(t, `https://localhost:15000/certZ/[\w\d]{14,}`, resource.CertURL)
 	assert.Regexp(t, `https://localhost:15000/certZ/[\w\d]{14,}`, resource.CertStableURL)
 	assert.NotEmpty(t, resource.Certificate)

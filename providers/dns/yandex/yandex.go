@@ -1,19 +1,20 @@
-// Package yandex implements a DNS provider for solving the DNS-01 challenge using Yandex.
+// Package yandex implements a DNS provider for solving the DNS-01 challenge using Yandex PDD.
 package yandex
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
 	"time"
 
+	"github.com/go-acme/lego/v4/challenge"
 	"github.com/go-acme/lego/v4/challenge/dns01"
 	"github.com/go-acme/lego/v4/platform/config/env"
+	"github.com/go-acme/lego/v4/providers/dns/internal/clientdebug"
 	"github.com/go-acme/lego/v4/providers/dns/yandex/internal"
 	"github.com/miekg/dns"
 )
-
-const defaultTTL = 21600
 
 // Environment variables names.
 const (
@@ -27,6 +28,8 @@ const (
 	EnvHTTPTimeout        = envNamespace + "HTTP_TIMEOUT"
 )
 
+var _ challenge.ProviderTimeout = (*DNSProvider)(nil)
+
 // Config is used to configure the creation of the DNSProvider.
 type Config struct {
 	PddToken           string
@@ -39,7 +42,7 @@ type Config struct {
 // NewDefaultConfig returns a default configuration for the DNSProvider.
 func NewDefaultConfig() *Config {
 	return &Config{
-		TTL:                env.GetOrDefaultInt(EnvTTL, defaultTTL),
+		TTL:                env.GetOrDefaultInt(EnvTTL, 21600),
 		PropagationTimeout: env.GetOrDefaultSecond(EnvPropagationTimeout, dns01.DefaultPropagationTimeout),
 		PollingInterval:    env.GetOrDefaultSecond(EnvPollingInterval, dns01.DefaultPollingInterval),
 		HTTPClient: &http.Client{
@@ -74,7 +77,7 @@ func NewDNSProviderConfig(config *Config) (*DNSProvider, error) {
 	}
 
 	if config.PddToken == "" {
-		return nil, fmt.Errorf("yandex: credentials missing")
+		return nil, errors.New("yandex: credentials missing")
 	}
 
 	client, err := internal.NewClient(config.PddToken)
@@ -86,14 +89,16 @@ func NewDNSProviderConfig(config *Config) (*DNSProvider, error) {
 		client.HTTPClient = config.HTTPClient
 	}
 
+	client.HTTPClient = clientdebug.Wrap(client.HTTPClient)
+
 	return &DNSProvider{client: client, config: config}, nil
 }
 
 // Present creates a TXT record to fulfill the dns-01 challenge.
 func (d *DNSProvider) Present(domain, token, keyAuth string) error {
-	fqdn, value := dns01.GetRecord(domain, keyAuth)
+	info := dns01.GetChallengeInfo(domain, keyAuth)
 
-	rootDomain, subDomain, err := splitDomain(fqdn)
+	rootDomain, subDomain, err := splitDomain(info.EffectiveFQDN)
 	if err != nil {
 		return fmt.Errorf("yandex: %w", err)
 	}
@@ -103,10 +108,10 @@ func (d *DNSProvider) Present(domain, token, keyAuth string) error {
 		SubDomain: subDomain,
 		Type:      "TXT",
 		TTL:       d.config.TTL,
-		Content:   value,
+		Content:   info.Value,
 	}
 
-	_, err = d.client.AddRecord(data)
+	_, err = d.client.AddRecord(context.Background(), data)
 	if err != nil {
 		return fmt.Errorf("yandex: %w", err)
 	}
@@ -116,22 +121,24 @@ func (d *DNSProvider) Present(domain, token, keyAuth string) error {
 
 // CleanUp removes the TXT record matching the specified parameters.
 func (d *DNSProvider) CleanUp(domain, token, keyAuth string) error {
-	fqdn, value := dns01.GetRecord(domain, keyAuth)
+	info := dns01.GetChallengeInfo(domain, keyAuth)
 
-	rootDomain, subDomain, err := splitDomain(fqdn)
+	rootDomain, subDomain, err := splitDomain(info.EffectiveFQDN)
 	if err != nil {
 		return fmt.Errorf("yandex: %w", err)
 	}
 
-	records, err := d.client.GetRecords(rootDomain)
+	ctx := context.Background()
+
+	records, err := d.client.GetRecords(ctx, rootDomain)
 	if err != nil {
 		return fmt.Errorf("yandex: %w", err)
 	}
 
 	var record *internal.Record
+
 	for _, rcd := range records {
-		rcd := rcd
-		if rcd.Type == "TXT" && rcd.SubDomain == subDomain && rcd.Content == value {
+		if rcd.Type == "TXT" && rcd.SubDomain == subDomain && rcd.Content == info.Value {
 			record = &rcd
 			break
 		}
@@ -146,10 +153,11 @@ func (d *DNSProvider) CleanUp(domain, token, keyAuth string) error {
 		Domain: rootDomain,
 	}
 
-	_, err = d.client.RemoveRecord(data)
+	_, err = d.client.RemoveRecord(ctx, data)
 	if err != nil {
 		return fmt.Errorf("yandex: %w", err)
 	}
+
 	return nil
 }
 

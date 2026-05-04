@@ -9,12 +9,11 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/go-acme/lego/v4/challenge"
 	"github.com/go-acme/lego/v4/challenge/dns01"
 	"github.com/go-acme/lego/v4/platform/config/env"
 	"github.com/go-acme/lego/v4/providers/dns/internal/selectel"
 )
-
-const minTTL = 60
 
 // Environment variables names.
 const (
@@ -29,23 +28,18 @@ const (
 	EnvHTTPTimeout        = envNamespace + "HTTP_TIMEOUT"
 )
 
+var _ challenge.ProviderTimeout = (*DNSProvider)(nil)
+
 // Config is used to configure the creation of the DNSProvider.
-type Config struct {
-	BaseURL            string
-	Token              string
-	PropagationTimeout time.Duration
-	PollingInterval    time.Duration
-	TTL                int
-	HTTPClient         *http.Client
-}
+type Config = selectel.Config
 
 // NewDefaultConfig returns a default configuration for the DNSProvider.
 func NewDefaultConfig() *Config {
 	return &Config{
-		BaseURL:            env.GetOrDefaultString(EnvBaseURL, selectel.DefaultSelectelBaseURL),
-		TTL:                env.GetOrDefaultInt(EnvTTL, minTTL),
+		BaseURL:            env.GetOrDefaultString(EnvBaseURL, ""),
+		TTL:                env.GetOrDefaultInt(EnvTTL, selectel.MinTTL),
 		PropagationTimeout: env.GetOrDefaultSecond(EnvPropagationTimeout, 120*time.Second),
-		PollingInterval:    env.GetOrDefaultSecond(EnvPollingInterval, 2*time.Second),
+		PollingInterval:    env.GetOrDefaultSecond(EnvPollingInterval, dns01.DefaultPollingInterval),
 		HTTPClient: &http.Client{
 			Timeout: env.GetOrDefaultSecond(EnvHTTPTimeout, 30*time.Second),
 		},
@@ -54,8 +48,7 @@ func NewDefaultConfig() *Config {
 
 // DNSProvider implements the challenge.Provider interface.
 type DNSProvider struct {
-	config *Config
-	client *selectel.Client
+	prv challenge.ProviderTimeout
 }
 
 // NewDNSProvider returns a DNSProvider instance configured for Selectel Domains API.
@@ -78,43 +71,17 @@ func NewDNSProviderConfig(config *Config) (*DNSProvider, error) {
 		return nil, errors.New("selectel: the configuration of the DNS provider is nil")
 	}
 
-	if config.Token == "" {
-		return nil, errors.New("selectel: credentials missing")
-	}
-
-	if config.TTL < minTTL {
-		return nil, fmt.Errorf("selectel: invalid TTL, TTL (%d) must be greater than %d", config.TTL, minTTL)
-	}
-
-	client := selectel.NewClient(config.Token)
-	client.BaseURL = config.BaseURL
-	client.HTTPClient = config.HTTPClient
-
-	return &DNSProvider{config: config, client: client}, nil
-}
-
-// Timeout returns the Timeout and interval to use when checking for DNS propagation.
-// Adjusting here to cope with spikes in propagation times.
-func (d *DNSProvider) Timeout() (timeout, interval time.Duration) {
-	return d.config.PropagationTimeout, d.config.PollingInterval
-}
-
-// Present creates a TXT record to fulfill DNS-01 challenge.
-func (d *DNSProvider) Present(domain, token, keyAuth string) error {
-	fqdn, value := dns01.GetRecord(domain, keyAuth)
-
-	domainObj, err := d.client.GetDomainByName(domain)
+	provider, err := selectel.NewDNSProviderConfig(config)
 	if err != nil {
-		return fmt.Errorf("selectel: %w", err)
+		return nil, fmt.Errorf("selectel: %w", err)
 	}
 
-	txtRecord := selectel.Record{
-		Type:    "TXT",
-		TTL:     d.config.TTL,
-		Name:    fqdn,
-		Content: value,
-	}
-	_, err = d.client.AddRecord(domainObj.ID, txtRecord)
+	return &DNSProvider{prv: provider}, nil
+}
+
+// Present creates a TXT record using the specified parameters.
+func (d *DNSProvider) Present(domain, token, keyAuth string) error {
+	err := d.prv.Present(domain, token, keyAuth)
 	if err != nil {
 		return fmt.Errorf("selectel: %w", err)
 	}
@@ -122,31 +89,18 @@ func (d *DNSProvider) Present(domain, token, keyAuth string) error {
 	return nil
 }
 
-// CleanUp removes a TXT record used for DNS-01 challenge.
+// CleanUp removes the TXT record matching the specified parameters.
 func (d *DNSProvider) CleanUp(domain, token, keyAuth string) error {
-	fqdn, _ := dns01.GetRecord(domain, keyAuth)
-	recordName := dns01.UnFqdn(fqdn)
-
-	domainObj, err := d.client.GetDomainByName(domain)
+	err := d.prv.CleanUp(domain, token, keyAuth)
 	if err != nil {
 		return fmt.Errorf("selectel: %w", err)
 	}
 
-	records, err := d.client.ListRecords(domainObj.ID)
-	if err != nil {
-		return fmt.Errorf("selectel: %w", err)
-	}
+	return nil
+}
 
-	// Delete records with specific FQDN
-	var lastErr error
-	for _, record := range records {
-		if record.Name == recordName {
-			err = d.client.DeleteRecord(domainObj.ID, record.ID)
-			if err != nil {
-				lastErr = fmt.Errorf("selectel: %w", err)
-			}
-		}
-	}
-
-	return lastErr
+// Timeout returns the timeout and interval to use when checking for DNS propagation.
+// Adjusting here to cope with spikes in propagation times.
+func (d *DNSProvider) Timeout() (timeout, interval time.Duration) {
+	return d.prv.Timeout()
 }

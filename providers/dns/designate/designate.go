@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"slices"
 	"sync"
 	"time"
 
+	"github.com/go-acme/lego/v4/challenge"
 	"github.com/go-acme/lego/v4/challenge/dns01"
 	"github.com/go-acme/lego/v4/platform/config/env"
 	"github.com/gophercloud/gophercloud"
@@ -26,6 +28,8 @@ const (
 	EnvPropagationTimeout = envNamespace + "PROPAGATION_TIMEOUT"
 	EnvPollingInterval    = envNamespace + "POLLING_INTERVAL"
 
+	EnvZoneName = envNamespace + "ZONE_NAME"
+
 	envNamespaceClient = "OS_"
 
 	EnvAuthURL       = envNamespaceClient + "AUTH_URL"
@@ -41,8 +45,11 @@ const (
 	EnvCloud         = envNamespaceClient + "CLOUD"
 )
 
+var _ challenge.ProviderTimeout = (*DNSProvider)(nil)
+
 // Config is used to configure the creation of the DNSProvider.
 type Config struct {
+	ZoneName           string
 	PropagationTimeout time.Duration
 	PollingInterval    time.Duration
 	TTL                int
@@ -52,6 +59,7 @@ type Config struct {
 // NewDefaultConfig returns a default configuration for the DNSProvider.
 func NewDefaultConfig() *Config {
 	return &Config{
+		ZoneName:           env.GetOrFile(EnvZoneName),
 		TTL:                env.GetOrDefaultInt(EnvTTL, 10),
 		PropagationTimeout: env.GetOrDefaultSecond(EnvPropagationTimeout, 10*time.Minute),
 		PollingInterval:    env.GetOrDefaultSecond(EnvPollingInterval, 10*time.Second),
@@ -60,8 +68,9 @@ func NewDefaultConfig() *Config {
 
 // DNSProvider implements the challenge.Provider interface.
 type DNSProvider struct {
-	config       *Config
-	client       *gophercloud.ServiceClient
+	config *Config
+	client *gophercloud.ServiceClient
+
 	dnsEntriesMu sync.Mutex
 }
 
@@ -77,7 +86,6 @@ func NewDNSProvider() (*DNSProvider, error) {
 		opts, erro := clientconfig.AuthOptions(&clientconfig.ClientOpts{
 			Cloud: val[EnvCloud],
 		})
-
 		if erro != nil {
 			return nil, fmt.Errorf("designate: %w", erro)
 		}
@@ -124,37 +132,37 @@ func (d *DNSProvider) Timeout() (timeout, interval time.Duration) {
 
 // Present creates a TXT record to fulfill the dns-01 challenge.
 func (d *DNSProvider) Present(domain, token, keyAuth string) error {
-	fqdn, value := dns01.GetRecord(domain, keyAuth)
+	info := dns01.GetChallengeInfo(domain, keyAuth)
 
-	authZone, err := dns01.FindZoneByFqdn(fqdn)
-	if err != nil {
-		return fmt.Errorf("designate: couldn't get zone ID in Present: %w", err)
-	}
-
-	zoneID, err := d.getZoneID(authZone)
+	zone, err := d.getZoneName(info.EffectiveFQDN)
 	if err != nil {
 		return fmt.Errorf("designate: %w", err)
+	}
+
+	zoneID, err := d.getZoneID(zone)
+	if err != nil {
+		return fmt.Errorf("designate: couldn't get zone ID in Present: %w", err)
 	}
 
 	// use mutex to prevent race condition between creating the record and verifying it
 	d.dnsEntriesMu.Lock()
 	defer d.dnsEntriesMu.Unlock()
 
-	existingRecord, err := d.getRecord(zoneID, fqdn)
+	existingRecord, err := d.getRecord(zoneID, info.EffectiveFQDN)
 	if err != nil {
 		return fmt.Errorf("designate: %w", err)
 	}
 
 	if existingRecord != nil {
-		if contains(existingRecord.Records, value) {
-			log.Printf("designate: the record already exists: %s", value)
+		if slices.Contains(existingRecord.Records, info.Value) {
+			log.Printf("designate: the record already exists: %s", info.Value)
 			return nil
 		}
 
-		return d.updateRecord(existingRecord, value)
+		return d.updateRecord(existingRecord, info.Value)
 	}
 
-	err = d.createRecord(zoneID, fqdn, value)
+	err = d.createRecord(zoneID, info.EffectiveFQDN, info.Value)
 	if err != nil {
 		return fmt.Errorf("designate: %w", err)
 	}
@@ -164,14 +172,14 @@ func (d *DNSProvider) Present(domain, token, keyAuth string) error {
 
 // CleanUp removes the TXT record matching the specified parameters.
 func (d *DNSProvider) CleanUp(domain, token, keyAuth string) error {
-	fqdn, _ := dns01.GetRecord(domain, keyAuth)
+	info := dns01.GetChallengeInfo(domain, keyAuth)
 
-	authZone, err := dns01.FindZoneByFqdn(fqdn)
+	zone, err := d.getZoneName(info.EffectiveFQDN)
 	if err != nil {
-		return err
+		return fmt.Errorf("designate: %w", err)
 	}
 
-	zoneID, err := d.getZoneID(authZone)
+	zoneID, err := d.getZoneID(zone)
 	if err != nil {
 		return fmt.Errorf("designate: couldn't get zone ID in CleanUp: %w", err)
 	}
@@ -180,7 +188,7 @@ func (d *DNSProvider) CleanUp(domain, token, keyAuth string) error {
 	d.dnsEntriesMu.Lock()
 	defer d.dnsEntriesMu.Unlock()
 
-	record, err := d.getRecord(zoneID, fqdn)
+	record, err := d.getRecord(zoneID, info.EffectiveFQDN)
 	if err != nil {
 		return fmt.Errorf("designate: couldn't get Record ID in CleanUp: %w", err)
 	}
@@ -192,18 +200,10 @@ func (d *DNSProvider) CleanUp(domain, token, keyAuth string) error {
 
 	err = recordsets.Delete(d.client, zoneID, record.ID).ExtractErr()
 	if err != nil {
-		return fmt.Errorf("designate: error for %s in CleanUp: %w", fqdn, err)
+		return fmt.Errorf("designate: error for %s in CleanUp: %w", info.EffectiveFQDN, err)
 	}
-	return nil
-}
 
-func contains(values []string, value string) bool {
-	for _, v := range values {
-		if v == value {
-			return true
-		}
-	}
-	return false
+	return nil
 }
 
 func (d *DNSProvider) createRecord(zoneID, fqdn, value string) error {
@@ -228,7 +228,7 @@ func (d *DNSProvider) createRecord(zoneID, fqdn, value string) error {
 }
 
 func (d *DNSProvider) updateRecord(record *recordsets.RecordSet, value string) error {
-	if contains(record.Records, value) {
+	if slices.Contains(record.Records, value) {
 		log.Printf("skip: the record already exists: %s", value)
 		return nil
 	}
@@ -242,14 +242,20 @@ func (d *DNSProvider) updateRecord(record *recordsets.RecordSet, value string) e
 	}
 
 	result := recordsets.Update(d.client, record.ZoneID, record.ID, updateOpts)
+
 	return result.Err
 }
 
 func (d *DNSProvider) getZoneID(wanted string) (string, error) {
-	allPages, err := zones.List(d.client, nil).AllPages()
+	listOpts := zones.ListOpts{
+		Name: wanted,
+	}
+
+	allPages, err := zones.List(d.client, listOpts).AllPages()
 	if err != nil {
 		return "", err
 	}
+
 	allZones, err := zones.ExtractZones(allPages)
 	if err != nil {
 		return "", err
@@ -260,14 +266,21 @@ func (d *DNSProvider) getZoneID(wanted string) (string, error) {
 			return zone.ID, nil
 		}
 	}
+
 	return "", fmt.Errorf("zone id not found for %s", wanted)
 }
 
 func (d *DNSProvider) getRecord(zoneID, wanted string) (*recordsets.RecordSet, error) {
-	allPages, err := recordsets.ListByZone(d.client, zoneID, nil).AllPages()
+	listOpts := recordsets.ListOpts{
+		Name: wanted,
+		Type: "TXT",
+	}
+
+	allPages, err := recordsets.ListByZone(d.client, zoneID, listOpts).AllPages()
 	if err != nil {
 		return nil, err
 	}
+
 	allRecords, err := recordsets.ExtractRecordSets(allPages)
 	if err != nil {
 		return nil, err
@@ -280,4 +293,21 @@ func (d *DNSProvider) getRecord(zoneID, wanted string) (*recordsets.RecordSet, e
 	}
 
 	return nil, nil
+}
+
+func (d *DNSProvider) getZoneName(fqdn string) (string, error) {
+	if d.config.ZoneName != "" {
+		return d.config.ZoneName, nil
+	}
+
+	authZone, err := dns01.FindZoneByFqdn(fqdn)
+	if err != nil {
+		return "", fmt.Errorf("could not find zone for %s: %w", fqdn, err)
+	}
+
+	if authZone == "" {
+		return "", errors.New("empty zone name")
+	}
+
+	return authZone, nil
 }

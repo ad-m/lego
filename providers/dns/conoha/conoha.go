@@ -2,14 +2,17 @@
 package conoha
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
 	"time"
 
+	"github.com/go-acme/lego/v4/challenge"
 	"github.com/go-acme/lego/v4/challenge/dns01"
 	"github.com/go-acme/lego/v4/platform/config/env"
 	"github.com/go-acme/lego/v4/providers/dns/conoha/internal"
+	"github.com/go-acme/lego/v4/providers/dns/internal/clientdebug"
 )
 
 // Environment variables names.
@@ -26,6 +29,8 @@ const (
 	EnvPollingInterval    = envNamespace + "POLLING_INTERVAL"
 	EnvHTTPTimeout        = envNamespace + "HTTP_TIMEOUT"
 )
+
+var _ challenge.ProviderTimeout = (*DNSProvider)(nil)
 
 // Config is used to configure the creation of the DNSProvider.
 type Config struct {
@@ -85,6 +90,17 @@ func NewDNSProviderConfig(config *Config) (*DNSProvider, error) {
 		return nil, errors.New("conoha: some credentials information are missing")
 	}
 
+	identifier, err := internal.NewIdentifier(config.Region)
+	if err != nil {
+		return nil, fmt.Errorf("conoha: failed to create identity client: %w", err)
+	}
+
+	if config.HTTPClient != nil {
+		identifier.HTTPClient = config.HTTPClient
+	}
+
+	identifier.HTTPClient = clientdebug.Wrap(identifier.HTTPClient)
+
 	auth := internal.Auth{
 		TenantID: config.TenantID,
 		PasswordCredentials: internal.PasswordCredentials{
@@ -93,36 +109,49 @@ func NewDNSProviderConfig(config *Config) (*DNSProvider, error) {
 		},
 	}
 
-	client, err := internal.NewClient(config.Region, auth, config.HTTPClient)
+	tokens, err := identifier.GetToken(context.TODO(), auth)
+	if err != nil {
+		return nil, fmt.Errorf("conoha: failed to log in: %w", err)
+	}
+
+	client, err := internal.NewClient(config.Region, tokens.Access.Token.ID)
 	if err != nil {
 		return nil, fmt.Errorf("conoha: failed to create client: %w", err)
 	}
+
+	if config.HTTPClient != nil {
+		client.HTTPClient = config.HTTPClient
+	}
+
+	client.HTTPClient = clientdebug.Wrap(client.HTTPClient)
 
 	return &DNSProvider{config: config, client: client}, nil
 }
 
 // Present creates a TXT record to fulfill the dns-01 challenge.
 func (d *DNSProvider) Present(domain, token, keyAuth string) error {
-	fqdn, value := dns01.GetRecord(domain, keyAuth)
+	info := dns01.GetChallengeInfo(domain, keyAuth)
 
-	authZone, err := dns01.FindZoneByFqdn(fqdn)
+	authZone, err := dns01.FindZoneByFqdn(info.EffectiveFQDN)
 	if err != nil {
-		return err
+		return fmt.Errorf("conoha: could not find zone for domain %q: %w", domain, err)
 	}
 
-	id, err := d.client.GetDomainID(authZone)
+	ctx := context.Background()
+
+	id, err := d.client.GetDomainID(ctx, authZone)
 	if err != nil {
 		return fmt.Errorf("conoha: failed to get domain ID: %w", err)
 	}
 
 	record := internal.Record{
-		Name: fqdn,
+		Name: info.EffectiveFQDN,
 		Type: "TXT",
-		Data: value,
+		Data: info.Value,
 		TTL:  d.config.TTL,
 	}
 
-	err = d.client.CreateRecord(id, record)
+	err = d.client.CreateRecord(ctx, id, record)
 	if err != nil {
 		return fmt.Errorf("conoha: failed to create record: %w", err)
 	}
@@ -132,24 +161,26 @@ func (d *DNSProvider) Present(domain, token, keyAuth string) error {
 
 // CleanUp clears ConoHa DNS TXT record.
 func (d *DNSProvider) CleanUp(domain, token, keyAuth string) error {
-	fqdn, value := dns01.GetRecord(domain, keyAuth)
+	info := dns01.GetChallengeInfo(domain, keyAuth)
 
-	authZone, err := dns01.FindZoneByFqdn(fqdn)
+	authZone, err := dns01.FindZoneByFqdn(info.EffectiveFQDN)
 	if err != nil {
-		return err
+		return fmt.Errorf("conoha: could not find zone for domain %q: %w", domain, err)
 	}
 
-	domID, err := d.client.GetDomainID(authZone)
+	ctx := context.Background()
+
+	domID, err := d.client.GetDomainID(ctx, authZone)
 	if err != nil {
 		return fmt.Errorf("conoha: failed to get domain ID: %w", err)
 	}
 
-	recID, err := d.client.GetRecordID(domID, fqdn, "TXT", value)
+	recID, err := d.client.GetRecordID(ctx, domID, info.EffectiveFQDN, "TXT", info.Value)
 	if err != nil {
 		return fmt.Errorf("conoha: failed to get record ID: %w", err)
 	}
 
-	err = d.client.DeleteRecord(domID, recID)
+	err = d.client.DeleteRecord(ctx, domID, recID)
 	if err != nil {
 		return fmt.Errorf("conoha: failed to delete record: %w", err)
 	}

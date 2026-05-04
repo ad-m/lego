@@ -1,20 +1,14 @@
-.PHONY: default clean hugo hugo-build
+.PHONY: default clean serve build
 
-default: hugo
+default: clean serve
 
 clean:
 	rm -rf public/
 
 
-hugo-build: clean hugo-themes
+build: clean
 	hugo --enableGitInfo --source .
 
-hugo:
+serve:
 	hugo server --disableFastRender --enableGitInfo --watch --source .
 	# hugo server -D
-
-hugo-themes:
-	rm -rf themes
-	mkdir themes
-	git clone --depth=1 https://github.com/matcornic/hugo-theme-learn.git themes/hugo-theme-learn
-	rm -rf themes/hugo-theme-learn/.git
